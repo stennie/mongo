@@ -28,7 +28,6 @@
 #include "request.h"
 #include "config.h"
 #include "chunk.h"
-#include "stats.h"
 #include "cursors.h"
 #include "grid.h"
 #include "client_info.h"
@@ -48,20 +47,6 @@ namespace mongo {
         else {
             _clientInfo->newRequest();
         }
-    }
-
-    void Request::checkAuth( Auth::Level levelNeeded , const char * need ) const {
-        char cl[256];
-
-        const char * use = cl;
-        if ( need )
-            use = need;
-        else
-            nsToDatabase(getns(), cl);
-
-        uassert( 15845 ,
-                 str::stream() << "unauthorized for db:" << use << " level: " << levelNeeded ,
-                 _clientInfo->getAuthenticationInfo()->isAuthorizedForLevel(use,levelNeeded) );
     }
 
     void Request::init() {
@@ -130,21 +115,23 @@ namespace mongo {
                << endl;
 
         Strategy * s = SHARDED;
-        _counter = &opsNonSharded;
 
         _d.markSet();
 
         bool iscmd = false;
         if ( op == dbQuery ) {
             iscmd = isCommand();
-            s->queryOp( *this );
+            if (iscmd) {
+                SINGLE->queryOp(*this);
+            }
+            else {
+                s->queryOp( *this );
+            }
         }
         else if ( op == dbGetMore ) {
-            checkAuth( Auth::READ ); // this is important so someone can't steal a cursor
             s->getMore( *this );
         }
         else {
-            checkAuth( Auth::WRITE );
             s->writeOp( op, *this );
         }
 
@@ -156,7 +143,6 @@ namespace mongo {
                << endl;
 
         globalOpCounters.gotOp( op , iscmd );
-        _counter->gotOp( op , iscmd );
     }
 
     bool Request::isCommand() const {
@@ -166,7 +152,6 @@ namespace mongo {
 
     void Request::gotInsert() {
         globalOpCounters.gotInsert();
-        _counter->gotInsert();
     }
 
     void Request::reply( Message & response , const string& fromServer ) {
@@ -174,7 +159,7 @@ namespace mongo {
         long long cursor =response.header()->getCursor();
         if ( cursor ) {
             if ( fromServer.size() ) {
-                cursorCache.storeRef( fromServer , cursor );
+                cursorCache.storeRef(fromServer, cursor, getns());
             }
             else {
                 // probably a getMore

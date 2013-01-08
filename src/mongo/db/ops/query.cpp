@@ -17,19 +17,22 @@
  */
 
 #include "pch.h"
-#include "query.h"
-#include "../pdfile.h"
-#include "../clientcursor.h"
-#include "../oplog.h"
-#include "../../bson/util/builder.h"
-#include "../replutil.h"
-#include "../scanandorder.h"
-#include "../commands.h"
-#include "../queryoptimizer.h"
-#include "../../s/d_logic.h"
-#include "../../server.h"
-#include "../queryoptimizercursor.h"
-#include "../pagefault.h"
+
+#include "mongo/db/ops/query.h"
+
+#include "mongo/bson/util/builder.h"
+#include "mongo/db/clientcursor.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/oplog.h"
+#include "mongo/db/pagefault.h"
+#include "mongo/db/pdfile.h"
+#include "mongo/db/queryoptimizer.h"
+#include "mongo/db/queryoptimizercursor.h"
+#include "mongo/db/replutil.h"
+#include "mongo/db/scanandorder.h"
+#include "mongo/s/d_logic.h"
+#include "mongo/s/stale_exception.h"  // for SendStaleConfigException
+#include "mongo/server.h"
 
 namespace mongo {
 
@@ -82,8 +85,6 @@ namespace mongo {
 
     QueryResult* processGetMore(const char *ns, int ntoreturn, long long cursorid , CurOp& curop, int pass, bool& exhaust ) {
         exhaust = false;
-        ClientCursor::Pin p(cursorid);
-        ClientCursor *cc = p.c();
 
         int bufSize = 512 + sizeof( QueryResult ) + MaxBytesToReturnToClientAtOnce;
 
@@ -92,6 +93,14 @@ namespace mongo {
         int resultFlags = ResultFlag_AwaitCapable;
         int start = 0;
         int n = 0;
+
+        Client::ReadContext ctx(ns);
+        // call this readlocked so state can't change
+        replVerifyReadsOk();
+
+        ClientCursor::Pin p(cursorid);
+        ClientCursor *cc = p.c();
+
 
         if ( unlikely(!cc) ) {
             LOGSOME << "getMore: cursorid not found " << ns << " " << cursorid << endl;
@@ -672,8 +681,13 @@ namespace mongo {
         }
         else {
             cursor =
-                NamespaceDetailsTransient::getCursor( ns.c_str(), query, order, QueryPlanSelectionPolicy::any(),
-                                                      0, pq_shared, false, &queryPlan );
+                NamespaceDetailsTransient::getCursor( ns.c_str(),
+                                                      query,
+                                                      order,
+                                                      QueryPlanSelectionPolicy::any(),
+                                                      pq_shared,
+                                                      false,
+                                                      &queryPlan );
         }
         verify( cursor );
         
@@ -810,13 +824,9 @@ namespace mongo {
         qr->setOperation(opReply);
         qr->startingFrom = 0;
         qr->nReturned = nReturned;
-        
-        int duration = curop.elapsedMillis();
-        bool dbprofile = curop.shouldDBProfile( duration );
-        if ( dbprofile || duration >= cmdLine.slowMS ) {
-            curop.debug().nscanned = ( cursor ? cursor->nscanned() : 0LL );
-            curop.debug().ntoskip = pq.getSkip();
-        }
+
+        curop.debug().nscanned = ( cursor ? cursor->nscanned() : 0LL );
+        curop.debug().ntoskip = pq.getSkip();
         curop.debug().nreturned = nReturned;
 
         return curop.debug().exhaust ? ns : "";
@@ -927,13 +937,13 @@ namespace mongo {
         // Run a command.
         
         if ( pq.couldBeCommand() ) {
+            curop.markCommand();
             BufBuilder bb;
             bb.skip(sizeof(QueryResult));
             BSONObjBuilder cmdResBuf;
             if ( runCommands(ns, jsobj, curop, bb, cmdResBuf, false, queryOptions) ) {
                 curop.debug().iscommand = true;
                 curop.debug().query = jsobj;
-                curop.markCommand();
 
                 auto_ptr< QueryResult > qr;
                 qr.reset( (QueryResult *) bb.buf() );

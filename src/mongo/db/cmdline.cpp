@@ -20,8 +20,10 @@
 
 #include "mongo/db/cmdline.h"
 
-#include "mongo/util/map_util.h"
+#include "mongo/base/status.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/db/server_parameters.h"
+#include "mongo/util/map_util.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/listen.h"
 #include "mongo/util/password.h"
@@ -77,13 +79,12 @@ namespace {
         ("port", po::value<int>(&cmdLine.port), portInfoBuilder.str().c_str())
         ("bind_ip", po::value<string>(&cmdLine.bind_ip), "comma separated list of ip addresses to listen on - all local ips by default")
         ("maxConns",po::value<int>(), maxConnInfoBuilder.str().c_str())
-        ("objcheck", "inspect client data for validity on receipt")
         ("logpath", po::value<string>() , "log file to send write to instead of stdout - has to be a file, not directory" )
         ("logappend" , "append to logpath instead of over-writing" )
         ("pidfilepath", po::value<string>(), "full path to pidfile (if not set, no pidfile is created)")
         ("keyFile", po::value<string>(), "private key for cluster authentication")
-        ("enableFaultInjection", "enable the fault injection framework, for debugging."
-                " DO NOT USE IN PRODUCTION")
+        ("setParameter", po::value< std::vector<std::string> >()->composing(),
+                "Set a configurable parameter")
 #ifndef _WIN32
         ("nounixsocket", "disable listening on unix sockets")
         ("unixSocketPrefix", po::value<string>(), "alternative directory for UNIX domain sockets (defaults to /tmp)")
@@ -98,12 +99,24 @@ namespace {
         ("sslOnNormalPorts" , "use ssl on configured ports" )
         ("sslPEMKeyFile" , po::value<string>(&cmdLine.sslPEMKeyFile), "PEM file for ssl" )
         ("sslPEMKeyPassword" , new PasswordValue(&cmdLine.sslPEMKeyPassword) , "PEM file password" )
+        ("sslCAFile", po::value<std::string>(&cmdLine.sslCAFile), 
+         "Certificate Authority file for SSL")
+        ("sslCRLFile", po::value<std::string>(&cmdLine.sslCRLFile),
+         "Certificate Revocation List file for SSL")
+        ("sslForceCertificateValidation", "require each client to present a valid certificate")
 #endif
         ;
         
         // Extra hidden options
         hidden.add_options()
-        ("traceExceptions", "log stack traces for every exception");
+        ("objcheck", "inspect client data for validity on receipt (DEFAULT)")
+        ("noobjcheck", "do NOT inspect client data for validity on receipt")
+        ("traceExceptions", "log stack traces for every exception")
+        ("enableExperimentalIndexStatsCmd", po::bool_switch(&cmdLine.experimental.indexStatsCmdEnabled),
+                "EXPERIMENTAL (UNSUPPORTED). Enable command computing aggregate statistics on indexes.")
+        ("enableExperimentalStorageDetailsCmd", po::bool_switch(&cmdLine.experimental.storageDetailsCmdEnabled),
+                "EXPERIMENTAL (UNSUPPORTED). Enable command computing aggregate statistics on storage.")
+        ;
     }
 
 #if defined(_WIN32)
@@ -307,6 +320,13 @@ namespace {
         if (params.count("objcheck")) {
             cmdLine.objcheck = true;
         }
+        if (params.count("noobjcheck")) {
+            if (params.count("objcheck")) {
+                out() << "can't have both --objcheck and --noobjcheck" << endl;
+                return false;
+            }
+            cmdLine.objcheck = false;
+        }
 
         if (params.count("bind_ip")) {
             // passing in wildcard is the same as default behavior; remove and warn
@@ -358,9 +378,56 @@ namespace {
             cmdLine.pidFile = params["pidfilepath"].as<string>();
         }
 
+        if (params.count("setParameter")) {
+            std::vector<std::string> parameters =
+                params["setParameter"].as<std::vector<std::string> >();
+            for (size_t i = 0, length = parameters.size(); i < length; ++i) {
+                std::string name;
+                std::string value;
+                if (!mongoutils::str::splitOn(parameters[i], '=', name, value)) {
+                    cout << "Illegal option assignment: \"" << parameters[i] << "\"" << endl;
+                    return false;
+                }
+                ServerParameter* parameter = mapFindWithDefault(
+                        ServerParameterSet::getGlobal()->getMap(),
+                        name,
+                        static_cast<ServerParameter*>(NULL));
+                if (NULL == parameter) {
+                    cout << "Illegal --option parameter: \"" << name << "\"" << endl;
+                    return false;
+                }
+                Status status = parameter->setFromString(value);
+                if (!status.isOK()) {
+                    cout << "Bad value for parameter \"" << name << "\": " << status.reason()
+                         << endl;
+                    return false;
+                }
+            }
+        }
+
 #ifdef MONGO_SSL
-        if (params.count("sslOnNormalPorts") ) {
+        if (params.count("sslForceCertificateValidation")) {
+            cmdLine.sslForceCertificateValidation = true;
+        }
+        if (params.count("sslOnNormalPorts")) {
             cmdLine.sslOnNormalPorts = true;
+            if ( cmdLine.sslPEMKeyFile.size() == 0 ) {
+                log() << "need sslPEMKeyFile" << endl;
+                return false;
+            }
+            if (cmdLine.sslForceCertificateValidation &&
+                cmdLine.sslCAFile.empty()) {
+                log() << "need sslCAFile with sslForceCertificateValidation" << endl;
+                return false;
+            }
+        }
+        else if (cmdLine.sslPEMKeyFile.size() || 
+                 cmdLine.sslPEMKeyPassword.size() ||
+                 cmdLine.sslCAFile.size() ||
+                 cmdLine.sslCRLFile.size() ||
+                 cmdLine.sslForceCertificateValidation) {
+            log() << "need to enable sslOnNormalPorts" << endl;
+            return false;
         }
 #endif
 
@@ -448,17 +515,4 @@ namespace {
     void printCommandLineOpts() {
         log() << "options: " << parsedOpts << endl;
     }
-
-    map<string,ParameterValidator*>* pv_all(NULL);
-
-    ParameterValidator::ParameterValidator( const string& name ) : _name( name ) {
-        if ( ! pv_all)
-            pv_all = new map<string,ParameterValidator*>();
-        (*pv_all)[_name] = this;
-    }
-
-    ParameterValidator* ParameterValidator::get( const string& name ) {
-        return mapFindWithDefault(*pv_all, name, static_cast<ParameterValidator*>(NULL));
-    }
-
 }

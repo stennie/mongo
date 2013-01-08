@@ -27,8 +27,15 @@
 
 #include <boost/filesystem/convenience.hpp>
 #include <boost/filesystem/operations.hpp>
+#include <string>
+#include <vector>
 
-#include "mongo/db/btree.h"
+#include "mongo/base/init.h"
+#include "mongo/base/status.h"
+#include "mongo/db/auth/action_set.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/privilege.h"
 #include "mongo/db/cmdline.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/curop-inl.h"
@@ -53,14 +60,20 @@ namespace mongo {
         virtual LockType locktype() const { return WRITE; }
 
         virtual void help(stringstream& h) const { h << "internal"; }
-
+        virtual void addRequiredPrivileges(const std::string& dbname,
+                                           const BSONObj& cmdObj,
+                                           std::vector<Privilege>* out) {
+            ActionSet actions;
+            actions.addAction(ActionType::clean);
+            out->push_back(Privilege(parseNs(dbname, cmdObj), actions));
+        }
         bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
             string dropns = dbname + "." + cmdObj.firstElement().valuestrsafe();
 
             if ( !cmdLine.quiet )
                 tlog() << "CMD: clean " << dropns << endl;
 
-            NamespaceDetails *d = nsdetails(dropns.c_str());
+            NamespaceDetails *d = nsdetails(dropns);
 
             if ( ! d ) {
                 errmsg = "ns not found";
@@ -79,7 +92,8 @@ namespace mongo {
     namespace dur {
         boost::filesystem::path getJournalDir();
     }
- 
+
+    // Testing-only, enabled via command line
     class JournalLatencyTestCmd : public Command {
     public:
         JournalLatencyTestCmd() : Command( "journalLatencyTest" ) {}
@@ -88,7 +102,11 @@ namespace mongo {
         virtual LockType locktype() const { return NONE; }
         virtual bool adminOnly() const { return true; }
         virtual void help(stringstream& h) const { h << "test how long to write and fsync to a test file in the journal/ directory"; }
-
+        // No auth needed because it only works when enabled via command line.
+        virtual bool requiresAuth() { return false; }
+        virtual void addRequiredPrivileges(const std::string& dbname,
+                                           const BSONObj& cmdObj,
+                                           std::vector<Privilege>* out) {}
         bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
             boost::filesystem::path p = dur::getJournalDir();
             p /= "journalLatencyTest";
@@ -148,7 +166,14 @@ namespace mongo {
 
             return 1;
         }
-    } journalLatencyTestCmd;
+    };
+    MONGO_INITIALIZER(RegisterJournalLatencyTestCmd)(InitializerContext* context) {
+        if (Command::testCommandsEnabled) {
+            // Leaked intentionally: a Command registers itself when constructed.
+            new JournalLatencyTestCmd();
+        }
+        return Status::OK();
+    }
 
     class ValidateCmd : public Command {
     public:
@@ -162,11 +187,18 @@ namespace mongo {
                                                         "Add full:true option to do a more thorough check"; }
 
         virtual LockType locktype() const { return READ; }
+        virtual void addRequiredPrivileges(const std::string& dbname,
+                                           const BSONObj& cmdObj,
+                                           std::vector<Privilege>* out) {
+            ActionSet actions;
+            actions.addAction(ActionType::validate);
+            out->push_back(Privilege(parseNs(dbname, cmdObj), actions));
+        }
         //{ validate: "collectionnamewithoutthedbpart" [, scandata: <bool>] [, full: <bool> } */
 
         bool run(const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
             string ns = dbname + "." + cmdObj.firstElement().valuestrsafe();
-            NamespaceDetails * d = nsdetails( ns.c_str() );
+            NamespaceDetails * d = nsdetails( ns );
             if ( !cmdLine.quiet )
                 tlog() << "CMD: validate " << ns << endl;
 

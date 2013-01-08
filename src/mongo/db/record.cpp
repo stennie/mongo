@@ -18,9 +18,11 @@
 
 #include "pch.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/databaseholder.h"
 #include "mongo/db/pagefault.h"
 #include "mongo/db/pdfile.h"
 #include "mongo/db/record.h"
+#include "mongo/db/commands/server_status.h"
 #include "mongo/platform/bits.h"
 #include "mongo/platform/unordered_set.h"
 #include "mongo/util/net/listen.h"
@@ -459,7 +461,7 @@ namespace mongo {
         if (seen || ps::rolling[ps::bigHash(region)].access( region , offset , false ) ) {
         
 #ifdef _DEBUG
-            if ( blockSupported && ! ProcessInfo::blockInMemory( const_cast<char*>(data) ) ) {
+            if ( blockSupported && ! ProcessInfo::blockInMemory(data) ) {
                 warning() << "we think data is in ram but system says no"  << endl;
             }
 #endif
@@ -527,4 +529,49 @@ namespace mongo {
 
     }
 
+    namespace {
+        
+        class WorkingSetSSS : public ServerStatusSection {
+        public:
+            WorkingSetSSS() : ServerStatusSection( "workingSet" ){}
+            virtual bool includeByDefault() const { return false; }
+            
+            BSONObj generateSection(const BSONElement& configElement) const {
+                BSONObjBuilder b;
+                Record::appendWorkingSetInfo( b );
+                return b.obj();
+            }
+                
+        } asserts;
+
+        class RecordStats : public ServerStatusSection {
+        public:
+            RecordStats() : ServerStatusSection( "recordStats" ){}
+            virtual bool includeByDefault() const { return true; }
+            
+            BSONObj generateSection(const BSONElement& configElement) const {
+                BSONObjBuilder record;
+                
+                Record::appendStats( record );
+
+                set<string> dbs;
+                {
+                    Lock::DBRead read( "local" );
+                    dbHolder().getAllShortNames( dbs );
+                }
+
+                for ( set<string>::iterator i = dbs.begin(); i != dbs.end(); ++i ) {
+                    string db = *i;
+                    Client::ReadContext ctx( db );
+                    BSONObjBuilder temp( record.subobjStart( db ) );
+                    ctx.ctx().db()->recordStats().record( temp );
+                    temp.done();
+                }
+
+                return record.obj();
+            }
+                
+        } recordStats;
+
+    }
 }

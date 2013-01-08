@@ -6,7 +6,7 @@ import cpplint
 import utils
 
 
-def run_lint( prefix="src/mongo", nudgeOn=False ):
+def run_lint( paths, nudgeOn=False ):
     # errors are as of 10/14
     # idea is not to let it any new type of error
     # as we knock one out, we should remove line
@@ -40,7 +40,6 @@ def run_lint( prefix="src/mongo", nudgeOn=False ):
     later.append( '-whitespace/comma' ) # errors found: 621
     later.append( '-whitespace/comments' ) # errors found: 2189
     later.append( '-whitespace/end_of_line' ) # errors found: 4340
-    nudge.append( '-whitespace/indent' ) # errors found: 8
     later.append( '-whitespace/labels' ) # errors found: 58
     later.append( '-whitespace/line_length' ) # errors found: 14500
     later.append( '-whitespace/newline' ) # errors found: 1520
@@ -53,9 +52,12 @@ def run_lint( prefix="src/mongo", nudgeOn=False ):
     if not nudgeOn:
         filters = filters + nudge
 
+        
+    sourceFiles = []
+    for x in paths:
+        utils.getAllSourceFiles( sourceFiles, x )
 
 
-    sourceFiles = utils.getAllSourceFiles( prefix=prefix )
     args = [ "--filter=" + ",".join( filters ) , "--counting=detailed" ] + sourceFiles
     filenames = cpplint.ParseArguments( args  )
 
@@ -84,7 +86,7 @@ def run_lint( prefix="src/mongo", nudgeOn=False ):
 
 
 if __name__ == "__main__":
-    prefix = "src/mongo"
+    paths = []
     nudge = False
     
     for arg in sys.argv[1:]:
@@ -92,10 +94,14 @@ if __name__ == "__main__":
             arg = arg[2:]
             if arg == "nudge":
                 nudge = True
+                continue
             else:
                 print( "unknown arg [%s]" % arg )
                 sys.exit(-1)
-        prefix = arg
+        paths.append( arg )
 
-    if not run_lint( prefix, nudge ):
+    if len(paths) == 0:
+        paths.append( "src/mongo/" )
+
+    if not run_lint( paths, nudge ):
         sys.exit(-1)

@@ -17,9 +17,17 @@
 */
 
 #include "pch.h"
+
+#include <string>
+#include <vector>
+
+#include "mongo/db/auth/action_set.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/privilege.h"
+#include "mongo/db/jsobj.h"
 #include "../../util/net/listen.h"
 #include "../commands.h"
-#include "../security.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/client/dbclientinterface.h"
 
@@ -89,17 +97,17 @@ namespace mongo {
         addrs = NULL;
 
         if (logLevel >= 1) {
-            log(1) << "getMyAddrs():";
+            LOG(1) << "getMyAddrs():";
             for (vector<string>::const_iterator it=out.begin(), end=out.end(); it!=end; ++it) {
-                log(1) << " [" << *it << ']';
+                LOG(1) << " [" << *it << ']';
             }
-            log(1) << endl;
+            LOG(1) << endl;
         }
 
         return out;
     }
 
-    vector<string> getAllIPs(StringData iporhost) {
+    vector<string> getAllIPs(const string& iporhost) {
         addrinfo* addrs = NULL;
         addrinfo hints;
         memset(&hints, 0, sizeof(addrinfo));
@@ -110,9 +118,9 @@ namespace mongo {
 
         vector<string> out;
 
-        int ret = getaddrinfo(iporhost.data(), portNum.c_str(), &hints, &addrs);
+        int ret = getaddrinfo(iporhost.c_str(), portNum.c_str(), &hints, &addrs);
         if ( ret ) {
-            warning() << "getaddrinfo(\"" << iporhost.data() << "\") failed: " << gai_strerror(ret) << endl;
+            warning() << "getaddrinfo(\"" << iporhost << "\") failed: " << gai_strerror(ret) << endl;
             return out;
         }
 
@@ -133,11 +141,11 @@ namespace mongo {
         freeaddrinfo(addrs);
 
         if (logLevel >= 1) {
-            log(1) << "getallIPs(\"" << iporhost << "\"):";
+            LOG(1) << "getallIPs(\"" << iporhost << "\"):";
             for (vector<string>::const_iterator it=out.begin(), end=out.end(); it!=end; ++it) {
-                log(1) << " [" << *it << ']';
+                LOG(1) << " [" << *it << ']';
             }
-            log(1) << endl;
+            LOG(1) << endl;
         }
 
         return out;
@@ -153,7 +161,9 @@ namespace mongo {
         virtual void help( stringstream &help ) const {
             help << "{ _isSelf : 1 } INTERNAL ONLY";
         }
-
+        virtual void addRequiredPrivileges(const std::string& dbname,
+                                           const BSONObj& cmdObj,
+                                           std::vector<Privilege>* out) {} // No auth required
         bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
             init();
             result.append( "id" , _id );
@@ -237,8 +247,6 @@ namespace mongo {
                 if (!conn.auth("local", internalSecurity.user, internalSecurity.pwd, errmsg, false)) {
                     return false;
                 }
-                conn.setAuthenticationTable(
-                        AuthenticationTable::getInternalSecurityAuthenticationTable() );
             }
 
             BSONObj out;

@@ -65,6 +65,9 @@ namespace mongo {
         **/
         void notifyAllWaiters();
 
+        /** Reset the object to its initial state.  Only for testing. */
+        void reset();
+
     private:
         void interruptJs( AtomicUInt *op );
         volatile bool _globalKill;
@@ -76,7 +79,7 @@ namespace mongo {
          * @param pNotifyFlag optional bool to be set to true when kill actually happens
          * @return if operation was found 
          **/
-        bool killImpl(AtomicUInt i, bool* pNotifyFlag = NULL);        
+        bool _killImpl_inclientlock(AtomicUInt i, bool* pNotifyFlag = NULL);
     };
 
     extern KillCurrentOp killCurrentOp;

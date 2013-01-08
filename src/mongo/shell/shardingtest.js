@@ -274,6 +274,7 @@ ShardingTest = function( testName , numShards , verboseLevel , numMongos , other
         
         rs.getMaster().getDB( "admin" ).foo.save( { x : 1 } )
         rs.awaitReplication();
+        rs.awaitSecondaryNodes();
         
         var rsConn = new Mongo( rs.getURL() );
         rsConn.name = rs.getURL();
@@ -972,6 +973,19 @@ ShardingTest.prototype.startBalancer = function( timeout, interval ) {
     db = this.config
     sh.waitForBalancer( true, timeout, interval )
     db = oldDB
+}
+
+ShardingTest.prototype.isAnyBalanceInFlight = function() {
+    if ( this.config.locks.find({ _id : { $ne : "balancer" }, state : 2 }).count() > 0 )
+        return true;
+
+    var allCurrent = this.s.getDB( "admin" ).currentOp().inprog;
+    for ( var i = 0; i < allCurrent.length; i++ ) {
+        if ( allCurrent[i].desc &&
+             allCurrent[i].desc.indexOf( "cleanupOldData" ) == 0 )
+            return true;
+    }
+    return false;
 }
 
 /**

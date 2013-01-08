@@ -29,7 +29,7 @@
 #include "mongo/db/namespacestring.h"
 #include "mongo/tools/tool.h"
 #include "mongo/util/mmap.h"
-#include "mongo/util/version.h"
+#include "mongo/util/stringutils.h"
 #include "mongo/db/json.h"
 #include "mongo/client/dbclientcursor.h"
 
@@ -104,7 +104,7 @@ public:
         _keepIndexVersion = hasParam("keepIndexVersion");
         _restoreOptions = !hasParam("noOptionsRestore");
         _restoreIndexes = !hasParam("noIndexRestore");
-        _w = getParam( "w" , 1 );
+        _w = getParam( "w" , 0 );
 
         bool doOplog = hasParam( "oplogReplay" );
 
@@ -177,7 +177,8 @@ public:
     }
 
     void drillDown( boost::filesystem::path root, bool use_db, bool use_coll, bool top_level=false ) {
-        log(2) << "drillDown: " << root.string() << endl;
+        bool json_metadata = false;
+        LOG(2) << "drillDown: " << root.string() << endl;
 
         // skip hidden files and directories
         if (root.leaf().string()[0] == '.' && root.leaf().string() != ".")
@@ -209,6 +210,11 @@ public:
                     }
                 }
 
+                // Ignore system.indexes.bson if we have *.metadata.json files
+                if ( endsWith( p.string().c_str() , ".metadata.json" ) ) {
+                    json_metadata = true;
+                }
+
                 // don't insert oplog
                 if (top_level && !use_db && p.leaf() == "oplog.bson")
                     continue;
@@ -220,8 +226,9 @@ public:
                 }
             }
 
-            if (!indexes.empty())
+            if (!indexes.empty() && !json_metadata) {
                 drillDown(indexes, use_db, use_coll);
+            }
 
             return;
         }
@@ -353,7 +360,7 @@ public:
             conn().runCommand(db, cmd, out);
 
             // wait for ops to propagate to "w" nodes (doesn't warn if w used without replset)
-            if ( _w > 1 ) {
+            if ( _w > 0 ) {
                 conn().getLastError(db, false, false, _w);
             }
         }
@@ -370,7 +377,7 @@ public:
             conn().insert( _curns , obj );
 
             // wait for insert to propagate to "w" nodes (doesn't warn if w used without replset)
-            if ( _w > 1 ) {
+            if ( _w > 0 ) {
                 conn().getLastErrorDetailed(_curdb, false, false, _w);
             }
         }
@@ -475,7 +482,7 @@ private:
             }
         }
         BSONObj o = bo.obj();
-        log(0) << "\tCreating index: " << o << endl;
+        LOG(0) << "\tCreating index: " << o << endl;
         conn().insert( _curdb + ".system.indexes" ,  o );
 
         // We're stricter about errors for indexes than for regular data

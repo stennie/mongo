@@ -26,11 +26,11 @@
 #include <boost/lexical_cast.hpp>
 #include <boost/static_assert.hpp>
 
+#include "mongo/bson/bson_validate.h"
 #include "mongo/bson/oid.h"
 #include "mongo/bson/util/atomic_int.h"
 #include "mongo/db/jsobjmanipulator.h"
 #include "mongo/db/json.h"
-#include "mongo/db/nonce.h"
 #include "mongo/platform/float_utils.h"
 #include "mongo/util/base64.h"
 #include "mongo/util/embedded_builder.h"
@@ -57,6 +57,7 @@ namespace mongo {
 
     DateNowLabeler DATENOW;
     NullLabeler BSONNULL;
+    UndefinedLabeler BSONUndefined;
 
     MinKeyLabeler MINKEY;
     MaxKeyLabeler MAXKEY;
@@ -243,7 +244,12 @@ namespace mongo {
             break;
 
         case Timestamp:
-            s << "{ \"t\" : " << timestampTime() << " , \"i\" : " << timestampInc() << " }";
+            if ( format == TenGen ) {
+                s << "Timestamp( " << ( timestampTime() / 1000 ) << ", " << timestampInc() << " )";
+            }
+            else {
+                s << "{ \"$timestamp\" : { \"t\" : " << ( timestampTime() / 1000 ) << ", \"i\" : " << timestampInc() << " } }";
+            }
             break;
 
         case MinKey:
@@ -291,9 +297,9 @@ namespace mongo {
             }
             else if ( fn[1] == 't' && fn[2] == 'y' && fn[3] == 'p' && fn[4] == 'e' && fn[5] == 0 )
                 return BSONObj::opTYPE;
-            else if ( fn[1] == 'i' && fn[2] == 'n' && fn[3] == 0 )
+            else if ( fn[1] == 'i' && fn[2] == 'n' && fn[3] == 0) {
                 return BSONObj::opIN;
-            else if ( fn[1] == 'n' && fn[2] == 'i' && fn[3] == 'n' && fn[4] == 0 )
+            } else if ( fn[1] == 'n' && fn[2] == 'i' && fn[3] == 'n' && fn[4] == 0 )
                 return BSONObj::NIN;
             else if ( fn[1] == 'a' && fn[2] == 'l' && fn[3] == 'l' && fn[4] == 0 )
                 return BSONObj::opALL;
@@ -311,9 +317,40 @@ namespace mongo {
                 return BSONObj::opOPTIONS;
             else if ( fn[1] == 'w' && fn[2] == 'i' && fn[3] == 't' && fn[4] == 'h' && fn[5] == 'i' && fn[6] == 'n' && fn[7] == 0 )
                 return BSONObj::opWITHIN;
+            else if (mongoutils::str::equals(fn + 1, "geoIntersects"))
+                return BSONObj::opGEO_INTERSECTS;
         }
         return def;
     }
+
+    /** transform a BSON array into a vector of BSONElements.
+        we match array # positions with their vector position, and ignore
+        any fields with non-numeric field names.
+        */
+    std::vector<BSONElement> BSONElement::Array() const {
+        chk(mongo::Array);
+        std::vector<BSONElement> v;
+        BSONObjIterator i(Obj());
+        while( i.more() ) {
+            BSONElement e = i.next();
+            const char *f = e.fieldName();
+
+            unsigned u;
+            Status status = parseNumberFromString( f, &u );
+            if ( status.isOK() ) {
+                verify( u < 1000000 );
+                if( u >= v.size() )
+                    v.resize(u+1);
+                v[u] = e;
+            }
+            else {
+                // ignore?
+            }
+        }
+        return v;
+    }
+
+
 
     /* Matcher --------------------------------------*/
 
@@ -426,35 +463,12 @@ namespace mongo {
 
     bool BSONObj::valid() const {
         int mySize = objsize();
-
-        try {
-            BSONObjIterator it(*this);
-            while( it.moreWithEOO() ) {
-                // both throw exception on failure
-                BSONElement e = it.next(true);
-                if ( e.size() >= mySize )
-                    return false;
-
-                e.validate();
-
-                if (e.eoo()) {
-                    if (it.moreWithEOO())
-                        return false;
-                    return true;
-                }
-                else if (e.isABSONObj()) {
-                    if(!e.embeddedObject().valid())
-                        return false;
-                }
-                else if (e.type() == CodeWScope) {
-                    if(!e.codeWScopeObject().valid())
-                        return false;
-                }
-            }
-        }
-        catch (...) {
-        }
-        return false;
+        int otherSize;
+        Status status = validateBSON( objdata(), mySize, &otherSize );
+        if ( ! status.isOK() )
+            return false;
+        verify( mySize == otherSize ); // should be impossible
+        return true;
     }
 
     int BSONObj::woCompare(const BSONObj& r, const Ordering &o, bool considerFieldName) const {
@@ -606,22 +620,23 @@ namespace mongo {
         BSONElement e = obj->getField( name );
 
         if ( e.eoo() ) {
-            const char *p = strchr(name.data(), '.');
-            if ( p ) {
-                string left(name.data(), p-name.data());
-                const char* next = p+1;
-                BSONElement e = obj->getField( left.c_str() );
+            size_t idx = name.find( '.' );
+            if ( idx != string::npos ) {
+                StringData left = name.substr( 0, idx );
+                StringData next = name.substr( idx + 1, name.size() );
+
+                BSONElement e = obj->getField( left );
 
                 if (e.type() == Object) {
                     e.embeddedObject().getFieldsDotted(next, ret, expandLastArray );
                 }
                 else if (e.type() == Array) {
                     bool allDigits = false;
-                    if ( isdigit( *next ) ) {
-                        const char * temp = next + 1;
-                        while ( isdigit( *temp ) )
+                    if ( next.size() > 0 && isdigit( next[0] ) ) {
+                        unsigned temp = 1;
+                        while ( temp < next.size() && isdigit( next[temp] ) )
                             temp++;
-                        allDigits = (*temp == '.' || *temp == '\0');
+                        allDigits = temp == next.size() || next[temp] == '.';
                     }
                     if (allDigits) {
                         e.embeddedObject().getFieldsDotted(next, ret, expandLastArray );

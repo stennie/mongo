@@ -24,6 +24,15 @@
 
 #include "mongo/db/client.h"
 
+#include <string>
+#include <vector>
+
+#include "mongo/base/status.h"
+#include "mongo/db/auth/action_set.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/auth_external_state_d.h"
+#include "mongo/db/auth/privilege.h"
 #include "mongo/db/db.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/curop-inl.h"
@@ -31,18 +40,20 @@
 #include "mongo/db/dbwebserver.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/json.h"
+#include "mongo/db/jsobj.h"
 #include "mongo/db/pagefault.h"
 #include "mongo/db/repl/rs.h"
+#include "mongo/s/chunk_version.h"
 #include "mongo/s/d_logic.h"
+#include "mongo/s/stale_exception.h" // for SendStaleConfigException
 #include "mongo/scripting/engine.h"
-#include "mongo/db/security.h"
 #include "mongo/util/file_allocator.h"
 #include "mongo/util/mongoutils/checksum.h"
 #include "mongo/util/mongoutils/html.h"
+#include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
-  
-    Client* Client::syncThread;
+
     mongo::mutex& Client::clientsMutex = *(new mutex("clientsMutex"));
     set<Client*>& Client::clients = *(new set<Client*>); // always be in clientsMutex when manipulating this
 
@@ -54,9 +65,13 @@ namespace mongo {
 
     struct StackChecker { 
 #if defined(_WIN32)
-        enum { SZ = 256 * 1024 };
+        enum { SZ = 330 * 1024 };
+#elif defined(__APPLE__) && defined(__MACH__)
+        enum { SZ = 374 * 1024 };
+#elif defined(__linux__)
+        enum { SZ = 218 * 1024 };
 #else
-        enum { SZ = 192 * 1024 };
+        enum { SZ = 218 * 1024 };   // default size, same as Linux to match old behavior
 #endif
         char buf[SZ];
         StackChecker() { 
@@ -109,16 +124,17 @@ namespace mongo {
         Client *c = new Client(desc, mp);
         currentClient.reset(c);
         mongo::lastError.initThread();
+        c->setAuthorizationManager(new AuthorizationManager(new AuthExternalStateMongod()));
         return *c;
     }
 
     Client::Client(const char *desc, AbstractMessagingPort *p) :
+        ClientBasic(p),
         _context(0),
         _shutdown(false),
         _desc(desc),
         _god(0),
-        _lastOp(0),
-        _mp(p)
+        _lastOp(0)
     {
         _hasWrittenThisPass = false;
         _pageFaultRetryableSection = 0;
@@ -149,16 +165,24 @@ namespace mongo {
 
         if ( ! inShutdown() ) {
             // we can't clean up safely once we're in shutdown
-            scoped_lock bl(clientsMutex);
-            if ( ! _shutdown )
-                clients.erase(this);
-            delete _curOp;
+            {
+                scoped_lock bl(clientsMutex);
+                if ( ! _shutdown )
+                    clients.erase(this);
+            }
+
+            CurOp* last;
+            do {
+                last = _curOp;
+                delete _curOp;
+                // _curOp may have been reset to _curOp->_wrapped
+            } while (_curOp != last);
         }
     }
 
     bool Client::shutdown() {
 #if defined(_DEBUG)
-        { 
+        {
             if( sizeof(void*) == 8 ) {
                 StackChecker::check( desc().c_str() );
             }
@@ -170,16 +194,13 @@ namespace mongo {
         {
             scoped_lock bl(clientsMutex);
             clients.erase(this);
-            if ( isSyncThread() ) {
-                syncThread = 0;
-            }
         }
 
         return false;
     }
 
     BSONObj CachedBSONObj::_tooBig = fromjson("{\"$msg\":\"query not recording (too large)\"}");
-    Client::Context::Context( const std::string& ns , Database * db, bool doauth ) :
+    Client::Context::Context(const std::string& ns , Database * db) :
         _client( currentClient.get() ), 
         _oldContext( _client->_context ),
         _path( mongo::dbpath ), // is this right? could be a different db? may need a dassert for this
@@ -190,10 +211,9 @@ namespace mongo {
     {
         verify( db == 0 || db->isOk() );
         _client->_context = this;
-        checkNsAccess( doauth );
     }
 
-    Client::Context::Context(const string& ns, const std::string& path , bool doauth, bool doVersion ) :
+    Client::Context::Context(const string& ns, const std::string& path, bool doVersion) :
         _client( currentClient.get() ), 
         _oldContext( _client->_context ),
         _path( path ), 
@@ -202,18 +222,18 @@ namespace mongo {
         _ns( ns ), 
         _db(0) 
     {
-        _finishInit( doauth );
+        _finishInit();
     }
        
     /** "read lock, and set my context, all in one operation" 
      *  This handles (if not recursively locked) opening an unopened database.
      */
-    Client::ReadContext::ReadContext(const string& ns, const std::string& path, bool doauth ) {
+    Client::ReadContext::ReadContext(const string& ns, const std::string& path) {
         {
             lk.reset( new Lock::DBRead(ns) );
             Database *db = dbHolder().get(ns, path);
             if( db ) {
-                c.reset( new Context(path, ns, db, doauth) );
+                c.reset( new Context(path, ns, db) );
                 return;
             }
         }
@@ -224,17 +244,17 @@ namespace mongo {
             if( Lock::isW() ) { 
                 // write locked already
                 DEV RARELY log() << "write locked on ReadContext construction " << ns << endl;
-                c.reset( new Context(ns, path, doauth) );
+                c.reset(new Context(ns, path));
             }
             else if( !Lock::nested() ) { 
                 lk.reset(0);
                 {
                     Lock::GlobalWrite w;
-                    Context c(ns, path, doauth);
+                    Context c(ns, path);
                 }
                 // db could be closed at this interim point -- that is ok, we will throw, and don't mind throwing.
                 lk.reset( new Lock::DBRead(ns) );
-                c.reset( new Context(ns, path, doauth) );
+                c.reset(new Context(ns, path));
             }
             else { 
                 uasserted(15928, str::stream() << "can't open a database from a nested read lock " << ns);
@@ -246,9 +266,9 @@ namespace mongo {
         //       it would be easy to first check that there is at least a .ns file, or something similar.
     }
 
-    Client::WriteContext::WriteContext(const string& ns, const std::string& path , bool doauth ) 
+    Client::WriteContext::WriteContext(const string& ns, const std::string& path)
         : _lk( ns ) ,
-          _c( ns , path , doauth ) {
+          _c(ns, path) {
     }
 
 
@@ -260,8 +280,8 @@ namespace mongo {
             break;
         default: {
             string errmsg;
-            ShardChunkVersion received;
-            ShardChunkVersion wanted;
+            ChunkVersion received;
+            ChunkVersion wanted;
             if ( ! shardVersionOk( _ns , errmsg, received, wanted ) ) {
                 ostringstream os;
                 os << "[" << _ns << "] shard version not ok in Client::Context: " << errmsg;
@@ -272,7 +292,7 @@ namespace mongo {
     }
 
     // invoked from ReadContext
-    Client::Context::Context(const string& path, const string& ns, Database *db , bool doauth) :
+    Client::Context::Context(const string& path, const string& ns, Database *db) :
         _client( currentClient.get() ), 
         _oldContext( _client->_context ),
         _path( path ), 
@@ -285,10 +305,9 @@ namespace mongo {
         checkNotStale();
         _client->_context = this;
         _client->_curOp->enter( this );
-        checkNsAccess( doauth );
     }
        
-    void Client::Context::_finishInit( bool doauth ) {
+    void Client::Context::_finishInit() {
         dassert( Lock::isLocked() );
         int writeLocked = Lock::somethingWriteLocked();
         if ( writeLocked && FileAllocator::get()->hasFailed() ) {
@@ -301,22 +320,6 @@ namespace mongo {
         massert( 16107 , str::stream() << "Don't have a lock on: " << _ns , Lock::atLeastReadLocked( _ns ) );
         _client->_context = this;
         _client->_curOp->enter( this );
-        checkNsAccess( doauth, writeLocked ? 1 : 0 );
-    }
-
-    void Client::Context::_auth( int lockState ) {
-        if (lockState <= 0 && str::endsWith(_ns, ".system.users"))
-            lockState = 1; // we don't want read-only users to be able to read system.users SERVER-4692
-
-        if ( _client->_ai.isAuthorizedForLock( _db->name , lockState ) )
-            return;
-
-        // before we assert, do a little cleanup
-        _client->_context = _oldContext; // note: _oldContext may be null
-
-        stringstream ss;
-        ss << "unauthorized db:" << _db->name << " ns:" << _ns << " lock type:" << lockState << " client:" << _client->clientAddress();
-        uasserted( 10057 , ss.str() );
     }
     
     Client::Context::~Context() {
@@ -339,18 +342,6 @@ namespace mongo {
 
         return  _ns[db.size()] == '.';
     }
-    
-    void Client::Context::checkNsAccess( bool doauth, int lockState ) {
-        if ( 0 ) { // SERVER-4276
-            uassert( 15929, "client access to index backing namespace prohibited", NamespaceString::normal( _ns.c_str() ) );
-        }
-        if ( doauth ) {
-            _auth( lockState );
-        }
-    }
-    void Client::Context::checkNsAccess( bool doauth ) {
-        checkNsAccess( doauth, Lock::somethingWriteLocked() ? 1 : 0 );
-    }
 
     void Client::appendLastOp( BSONObjBuilder& b ) const {
         // _lastOp is never set if replication is off
@@ -368,7 +359,7 @@ namespace mongo {
     string Client::toString() const {
         stringstream ss;
         if ( _curOp )
-            ss << _curOp->infoNoauth().jsonString();
+            ss << _curOp->info().jsonString();
         return ss.str();
     }
 
@@ -401,6 +392,10 @@ namespace mongo {
         }
     }
 
+    bool ClientBasic::hasCurrent() {
+        return currentClient.get();
+    }
+
     ClientBasic* ClientBasic::getCurrent() {
         return currentClient.get();
     }
@@ -412,6 +407,13 @@ namespace mongo {
         virtual LockType locktype() const { return NONE; }
         virtual bool slaveOk() const { return true; }
         virtual bool adminOnly() const { return false; }
+        virtual void addRequiredPrivileges(const std::string& dbname,
+                                           const BSONObj& cmdObj,
+                                           std::vector<Privilege>* out) {
+            ActionSet actions;
+            actions.addAction(ActionType::handshake);
+            out->push_back(Privilege(AuthorizationManager::SERVER_RESOURCE_NAME, actions));
+        }
         virtual bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             Client& c = cc();
             c.gotHandshake( cmdObj );
@@ -572,6 +574,8 @@ namespace mongo {
         idhack = false;
         scanAndOrder = false;
         nupdated = -1;
+        ninserted = -1;
+        ndeleted = -1;
         nmoved = -1;
         fastmod = false;
         fastmodinsert = false;
@@ -619,6 +623,8 @@ namespace mongo {
         OPDEBUG_TOSTRING_HELP_BOOL( scanAndOrder );
         OPDEBUG_TOSTRING_HELP( nmoved );
         OPDEBUG_TOSTRING_HELP( nupdated );
+        OPDEBUG_TOSTRING_HELP( ninserted );
+        OPDEBUG_TOSTRING_HELP( ndeleted );
         OPDEBUG_TOSTRING_HELP_BOOL( fastmod );
         OPDEBUG_TOSTRING_HELP_BOOL( fastmodinsert );
         OPDEBUG_TOSTRING_HELP_BOOL( upsert );
@@ -710,6 +716,8 @@ namespace mongo {
         OPDEBUG_APPEND_BOOL( moved );
         OPDEBUG_APPEND_NUMBER( nmoved );
         OPDEBUG_APPEND_NUMBER( nupdated );
+        OPDEBUG_APPEND_NUMBER( ninserted );
+        OPDEBUG_APPEND_NUMBER( ndeleted );
         OPDEBUG_APPEND_BOOL( fastmod );
         OPDEBUG_APPEND_BOOL( fastmodinsert );
         OPDEBUG_APPEND_BOOL( upsert );

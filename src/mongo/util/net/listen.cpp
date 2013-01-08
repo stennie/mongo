@@ -1,4 +1,4 @@
-// listen.h
+// listen.cpp
 
 /*    Copyright 2009 10gen Inc.
  *
@@ -96,11 +96,14 @@ namespace mongo {
     Listener::Listener(const string& name, const string &ip, int port, bool logConnect ) 
         : _port(port), _name(name), _ip(ip), _logConnect(logConnect), _elapsedTime(0) { 
 #ifdef MONGO_SSL
-        _ssl = 0;
-        _sslPort = 0;
-
-        if ( cmdLine.sslOnNormalPorts && cmdLine.sslServerManager ) {
-            secure( cmdLine.sslServerManager );
+        _ssl = NULL;
+        if (cmdLine.sslOnNormalPorts) {
+            const SSLParams params(cmdLine.sslPEMKeyFile, 
+                                   cmdLine.sslPEMKeyPassword,
+                                   cmdLine.sslCAFile,
+                                   cmdLine.sslCRLFile,
+                                   cmdLine.sslForceCertificateValidation);
+            _ssl = new SSLManager(params);
         }
 #endif
     }
@@ -108,19 +111,11 @@ namespace mongo {
     Listener::~Listener() {
         if ( _timeTracker == this )
             _timeTracker = 0;
-    }
-
 #ifdef MONGO_SSL
-    void Listener::secure( SSLManager* manager ) {
-        _ssl = manager;
-    }
-
-    void Listener::addSecurePort( SSLManager* manager , int additionalPort ) {
-        _ssl = manager;
-        _sslPort = additionalPort;
-    }
-
+        delete _ssl;
+        _ssl = 0;
 #endif
+    }
 
     bool Listener::_setupSockets( const vector<SockAddr>& mine , vector<SOCKET>& socks ) {
         for (vector<SockAddr>::const_iterator it=mine.begin(), end=mine.end(); it != end; ++it) {
@@ -190,28 +185,12 @@ namespace mongo {
     void Listener::initAndListen() {
         checkTicketNumbers();
         vector<SOCKET> socks;
-        set<int> sslSocks;
         
         { // normal sockets
             vector<SockAddr> mine = ipToAddrs(_ip.c_str(), _port, (!cmdLine.noUnixSocket && useUnixSockets()));
             if ( ! _setupSockets( mine , socks ) )
                 return;
         }
-        
-#ifdef MONGO_SSL
-        if ( _ssl && _sslPort > 0 ) {
-            unsigned prev = socks.size();
-            
-            vector<SockAddr> mine = ipToAddrs(_ip.c_str(), _sslPort, false );
-            if ( ! _setupSockets( mine , socks ) )
-                return;
-            
-            for ( unsigned i=prev; i<socks.size(); i++ ) {
-                sslSocks.insert( socks[i] );
-            }
-
-        }
-#endif
 
         SOCKET maxfd = 0; // needed for select()
         for ( unsigned i=0; i<socks.size(); i++ ) {
@@ -220,19 +199,9 @@ namespace mongo {
         }
         
 #ifdef MONGO_SSL
-        if ( _ssl == 0 ) {
-            _logListen( _port , false );
-        }
-        else if ( _sslPort == 0 ) {
-            _logListen( _port , true );
-        }
-        else {
-            // both
-            _logListen( _port , false );
-            _logListen( _sslPort , true );
-        }
+        _logListen(_port, _ssl);
 #else
-        _logListen( _port , false );
+        _logListen(_port, false);
 #endif
 
         struct timeval maxSelectTime;
@@ -320,8 +289,8 @@ namespace mongo {
                 
                 boost::shared_ptr<Socket> pnewSock( new Socket(s, from) );
 #ifdef MONGO_SSL
-                if ( _ssl && ( _sslPort == 0 || sslSocks.count(*it) ) ) {
-                    pnewSock->secureAccepted( _ssl );
+                if (_ssl) {
+                    pnewSock->secureAccepted(_ssl);
                 }
 #endif
                 accepted( pnewSock , myConnectionNumber );
@@ -363,7 +332,7 @@ namespace mongo {
 
         int max = (int)(limit.rlim_cur * .8);
 
-        log(1) << "fd limit"
+        LOG(1) << "fd limit"
                << " hard:" << limit.rlim_max
                << " soft:" << limit.rlim_cur
                << " max conn: " << max
@@ -383,7 +352,7 @@ namespace mongo {
             if ( current < want ) {
                 // they want fewer than they can handle
                 // which is fine
-                log(1) << " only allowing " << current << " connections" << endl;
+                LOG(1) << " only allowing " << current << " connections" << endl;
                 return;
             }
             if ( current > want ) {

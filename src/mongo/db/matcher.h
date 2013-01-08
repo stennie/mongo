@@ -22,6 +22,7 @@
 
 #include "jsobj.h"
 #include "pcrecpp.h"
+#include "mongo/db/geo/geoparser.h"
 
 namespace mongo {
 
@@ -47,6 +48,80 @@ namespace mongo {
         shared_ptr< pcrecpp::RE > _re;
         bool _isNot;
         RegexMatcher() : _isNot() {}
+    };
+
+    class GeoMatcher {
+    private:
+        GeoMatcher(const string& field, bool isNot) : _isBox(false), _isCircle(false),
+                                                      _isPolygon(false), _fieldName(field),
+                                                      _isNot(isNot) {}
+        bool _isBox;
+        Box _box;
+
+        bool _isCircle;
+        Point _center;
+        double _radius;
+
+        bool _isPolygon;
+        Polygon _polygon;
+
+        string _fieldName;
+        bool _isNot;
+    public:
+        const string& getFieldName() const { return _fieldName; }
+
+        static GeoMatcher makeBoxMatcher(const string& field, const BSONObj &obj, bool isNot) {
+            GeoMatcher m(field, isNot);
+            m._isBox = true;
+            GeoParser::parseLegacyBox(obj, &m._box);
+            return m;
+        }
+
+        static GeoMatcher makeCircleMatcher(const string& field, const BSONObj &obj, bool isNot) {
+            GeoMatcher m(field, isNot);
+            m._isCircle = true;
+            GeoParser::parseLegacyCenter(obj, &m._center, &m._radius);
+            return m;
+        }
+
+        static GeoMatcher makePolygonMatcher(const string& field, const BSONObj &obj, bool isNot) {
+            GeoMatcher m(field, isNot);
+            m._isPolygon = true;
+            GeoParser::parseLegacyPolygon(obj, &m._polygon);
+            return m;
+        }
+
+        bool containsPoint(Point p) const {
+            bool ret;
+            if (_isBox) {
+                ret = _box.inside(p, 0);
+            } else if (_isCircle) {
+                ret = distance(p, _center) <= _radius;
+            } else if (_isPolygon) {
+                ret = _polygon.contains(p);
+            } else {
+                ret = false;
+            }
+            return _isNot ? !ret : ret;
+        }
+
+        string toString() const {
+            stringstream ss;
+            if (_isBox) {
+                ss << "GeoMatcher Box: " << _box.toString();
+            } else if (_isCircle) {
+                ss << "GeoMatcher Circle @ " << _center.toString() << " r = " << _radius;
+            } else {
+                ss << "GeoMatcher UNKNOWN";
+            }
+            return ss.str();
+        }
+
+        static bool pointFrom(const BSONObj o, Point *p) {
+            if (!GeoParser::isLegacyPoint(o)) { return false; }
+            GeoParser::parseLegacyPoint(o, p);
+            return true;
+        }
     };
 
     struct element_lt {
@@ -220,13 +295,25 @@ namespace mongo {
          * value as the provided doc matcher.
          */
         bool keyMatch( const Matcher &docMatcher ) const;
-        
+
         bool singleSimpleCriterion() const {
-            return false; // TODO SERVER-958
-//            // TODO Really check, especially if all basics are ok.
-//            // $all, etc
-//            // _orConstraints?
-//            return ( ( basics.size() + nRegex ) < 2 ) && !where && !_orMatchers.size() && !_norMatchers.size();
+            if ( _where ||
+                 _basics.size() > 1 ||
+                 _haveNeg ||
+                 _haveSize ||
+                 _regexs.size() > 0 )
+                return false;
+
+            if ( _jsobj.nFields() > 1 )
+                return false;
+
+            if ( _basics.size() != 1 )
+                return false;
+
+            if ( strchr( _jsobj.firstElement().fieldName(), '.' ) )
+                return false;
+
+            return _basics[0]._compareOp == BSONObj::Equality;
         }
 
         const BSONObj *getQuery() const { return &_jsobj; };
@@ -273,6 +360,7 @@ namespace mongo {
         bool _atomic;
 
         vector<RegexMatcher> _regexs;
+        vector<GeoMatcher> _geo;
 
         // so we delete the mem when we're done:
         vector< shared_ptr< BSONObjBuilder > > _builders;

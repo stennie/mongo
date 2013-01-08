@@ -217,7 +217,7 @@ namespace mongo {
             _mmfs.clear();
         }
 
-        RecoveryJob::Last::Last() { 
+        RecoveryJob::Last::Last() : mmf(NULL), fileNo(-1) { 
             // we are keeping invariants so we need to be sure things aren't disappearing out from under us:
             LockMongoFilesShared::assertAtLeastReadLocked();
         }
@@ -259,7 +259,7 @@ namespace mongo {
             //TODO(mathias): look into making some of these dasserts
             verify(entry.e);
             verify(entry.dbName);
-            verify(strnlen(entry.dbName, MaxDatabaseNameLen) < MaxDatabaseNameLen);
+            verify((size_t)strnlen(entry.dbName, MaxDatabaseNameLen) < MaxDatabaseNameLen);
 
             MongoMMF *mmf = last.newEntry(entry, *this);
 
@@ -309,7 +309,7 @@ namespace mongo {
 
         MongoMMF* RecoveryJob::getMongoMMF(const ParsedJournalEntry& entry) {
             verify(entry.dbName);
-            verify(strnlen(entry.dbName, MaxDatabaseNameLen) < MaxDatabaseNameLen);
+            verify((size_t)strnlen(entry.dbName, MaxDatabaseNameLen) < MaxDatabaseNameLen);
 
             const string fn = fileName(entry.dbName, entry.e->getFileNo());
             MongoFile* file;
@@ -513,7 +513,7 @@ namespace mongo {
             log() << "recover lsn: " << _lastDataSyncedFromLastRun << endl;
 
             for( unsigned i = 0; i != files.size(); ++i ) {
-	      bool abruptEnd = processFile(files[i]);
+                bool abruptEnd = processFile(files[i]);
                 if( abruptEnd && i+1 < files.size() ) {
                     log() << "recover error: abrupt end to file " << files[i].string() << ", yet it isn't the last journal file" << endl;
                     close();

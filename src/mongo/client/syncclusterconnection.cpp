@@ -274,20 +274,6 @@ namespace mongo {
 
     // TODO: logout is required for use of this class outside of a cluster environment
 
-    void SyncClusterConnection::setAuthenticationTable( const AuthenticationTable& auth ) {
-        for( size_t i = 0; i < _conns.size(); ++i ) {
-            _conns[i]->setAuthenticationTable( auth );
-        }
-        DBClientWithCommands::setAuthenticationTable( auth );
-    }
-
-    void SyncClusterConnection::clearAuthenticationTable() {
-        for( size_t i = 0; i < _conns.size(); ++i ) {
-            _conns[i]->clearAuthenticationTable();
-        }
-        DBClientWithCommands::clearAuthenticationTable();
-    }
-
     auto_ptr<DBClientCursor> SyncClusterConnection::query(const string &ns, Query query, int nToReturn, int nToSkip,
             const BSONObj *fieldsToReturn, int queryOptions, int batchSize ) {
         _lastErrors.clear();
@@ -301,11 +287,7 @@ namespace mongo {
     }
 
     bool SyncClusterConnection::_commandOnActive(const string &dbname, const BSONObj& cmd, BSONObj &info, int options ) {
-        BSONObj actualCmd = cmd;
-        if ( hasAuthenticationTable() ) {
-            actualCmd = getAuthenticationTable().copyCommandObjAddingAuth( cmd );
-        }
-        auto_ptr<DBClientCursor> cursor = _queryOnActive( dbname + ".$cmd" , actualCmd , 1 , 0 , 0 , options , 0 );
+        auto_ptr<DBClientCursor> cursor = _queryOnActive(dbname + ".$cmd", cmd, 1, 0, 0, options, 0);
         if ( cursor->more() )
             info = cursor->next().copy();
         else
@@ -357,6 +339,11 @@ namespace mongo {
     }
 
     void SyncClusterConnection::insert( const string &ns, const vector< BSONObj >& v , int flags) {
+        if (v.size() == 1){
+            insert(ns, v[0], flags);
+            return;
+        }
+
         uassert( 10023 , "SyncClusterConnection bulk insert not implemented" , 0);
     }
 

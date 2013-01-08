@@ -19,7 +19,7 @@
 #include "mongo/pch.h"
 
 #include "mongo/db/btree.h"
-
+#include "mongo/db/btree_stats.h"
 #include "mongo/db/btreebuilder.h"
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
@@ -840,7 +840,7 @@ namespace mongo {
         // defensive:
         this->parent.Null();
         string ns = id.indexNamespace();
-        theDataFileMgr._deleteRecord(nsdetails(ns.c_str()), ns.c_str(), thisLoc.rec(), thisLoc);
+        theDataFileMgr._deleteRecord(nsdetails(ns), ns.c_str(), thisLoc.rec(), thisLoc);
 #endif
     }
 
@@ -893,6 +893,11 @@ namespace mongo {
      *
      * This function is only needed in cases where k has a left or right child;
      * in other cases a simpler key removal implementation is possible.
+     *
+     * NOTE on noncompliant BtreeBuilder btrees:
+     * It is possible (though likely rare) for btrees created by BtreeBuilder to
+     * have k' that is not a leaf, see SERVER-2732.  These cases are handled in
+     * the same manner as described in the "legacy btree structures" note below.
      *
      * NOTE on legacy btree structures:
      * In legacy btrees, k' can be a nonleaf.  In such a case we 'delete' k by
@@ -1433,7 +1438,7 @@ namespace mongo {
     template< class V >
     DiskLoc BtreeBucket<V>::addBucket(const IndexDetails& id) {
         string ns = id.indexNamespace();
-        DiskLoc loc = theDataFileMgr.insert(ns.c_str(), 0, V::BucketSize, true);
+        DiskLoc loc = theDataFileMgr.insert(ns.c_str(), 0, V::BucketSize, false, true);
         BtreeBucket *b = BTREEMOD(loc);
         b->init();
         return loc;
@@ -1706,7 +1711,7 @@ namespace mongo {
         if ( found ) {
             const _KeyNode& kn = k(pos);
             if ( kn.isUnused() ) {
-                log(4) << "btree _insert: reusing unused key" << endl;
+                LOG(4) << "btree _insert: reusing unused key" << endl;
                 c.b = this;
                 c.pos = pos;
                 c.op = IndexInsertionContinuation::SetUsed;
@@ -1761,7 +1766,7 @@ namespace mongo {
         if ( found ) {
             const _KeyNode& kn = k(pos);
             if ( kn.isUnused() ) {
-                log(4) << "btree _insert: reusing unused key" << endl;
+                LOG(4) << "btree _insert: reusing unused key" << endl;
                 massert( 10285 , "_insert: reuse key but lchild is not null", lChild.isNull());
                 massert( 10286 , "_insert: reuse key but rchild is not null", rChild.isNull());
                 kn.writing().setUsed();

@@ -16,20 +16,29 @@
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#include "pch.h"
-#include "oplog.h"
-#include "repl_block.h"
-#include "repl.h"
-#include "commands.h"
-#include "repl/rs.h"
-#include "stats/counters.h"
-#include "../util/file.h"
-#include "../util/startup_test.h"
-#include "queryoptimizer.h"
-#include "ops/update.h"
-#include "ops/delete.h"
+#include "mongo/pch.h"
+
+#include "mongo/db/oplog.h"
+
+#include <vector>
+
+#include "mongo/db/auth/action_set.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/privilege.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/index_update.h"
 #include "mongo/db/instance.h"
+#include "mongo/db/ops/update.h"
+#include "mongo/db/ops/delete.h"
+#include "mongo/db/queryoptimizer.h"
+#include "mongo/db/repl.h"
+#include "mongo/db/repl_block.h"
 #include "mongo/db/repl/bgsync.h"
+#include "mongo/db/repl/rs.h"
+#include "mongo/db/stats/counters.h"
+#include "mongo/util/elapsed_tracker.h"
+#include "mongo/util/file.h"
+#include "mongo/util/startup_test.h"
 
 namespace mongo {
 
@@ -67,13 +76,13 @@ namespace mongo {
         {
             const char *logns = rsoplog;
             if ( rsOplogDetails == 0 ) {
-                Client::Context ctx( logns , dbpath, false);
+                Client::Context ctx(logns , dbpath);
                 localDB = ctx.db();
                 verify( localDB );
                 rsOplogDetails = nsdetails(logns);
                 massert(13389, "local.oplog.rs missing. did you drop it? if so restart server", rsOplogDetails);
             }
-            Client::Context ctx( logns , localDB, false );
+            Client::Context ctx(logns , localDB);
             {
                 int len = op.objsize();
                 Record *r = theDataFileMgr.fast_oplog_insert(rsOplogDetails, logns, len);
@@ -198,13 +207,13 @@ namespace mongo {
         {
             const char *logns = rsoplog;
             if ( rsOplogDetails == 0 ) {
-                Client::Context ctx( logns , dbpath, false);
+                Client::Context ctx(logns , dbpath);
                 localDB = ctx.db();
                 verify( localDB );
                 rsOplogDetails = nsdetails(logns);
                 massert(13347, "local.oplog.rs missing. did you drop it? if so restart server", rsOplogDetails);
             }
-            Client::Context ctx( logns , localDB, false );
+            Client::Context ctx(logns , localDB);
             r = theDataFileMgr.fast_oplog_insert(rsOplogDetails, logns, len);
             /* todo: now() has code to handle clock skew.  but if the skew server to server is large it will get unhappy.
                      this code (or code in now() maybe) should be improved.
@@ -223,7 +232,7 @@ namespace mongo {
         append_O_Obj(r->data(), partial, obj);
 
         if ( logLevel >= 6 ) {
-            log( 6 ) << "logOp:" << BSONObj::make(r) << endl;
+            LOG( 6 ) << "logOp:" << BSONObj::make(r) << endl;
         }
     }
 
@@ -241,7 +250,7 @@ namespace mongo {
         mutex::scoped_lock lk2(OpTime::m);
 
         const OpTime ts = OpTime::now(lk2);
-        Client::Context context("",0,false);
+        Client::Context context("", 0);
 
         /* we jump through a bunch of hoops here to avoid copying the obj buffer twice --
            instead we do a single copy to the destination position in the memory mapped file.
@@ -267,17 +276,17 @@ namespace mongo {
         if( logNS == 0 ) {
             logNS = "local.oplog.$main";
             if ( localOplogMainDetails == 0 ) {
-                Client::Context ctx( logNS , dbpath, false);
+                Client::Context ctx(logNS , dbpath);
                 localDB = ctx.db();
                 verify( localDB );
                 localOplogMainDetails = nsdetails(logNS);
                 verify( localOplogMainDetails );
             }
-            Client::Context ctx( logNS , localDB, false );
+            Client::Context ctx(logNS , localDB);
             r = theDataFileMgr.fast_oplog_insert(localOplogMainDetails, logNS, len);
         }
         else {
-            Client::Context ctx( logNS, dbpath, false );
+            Client::Context ctx(logNS, dbpath);
             verify( nsdetails( logNS ) );
             // first we allocate the space, then we fill it below.
             r = theDataFileMgr.fast_oplog_insert( nsdetails( logNS ), logNS, len);
@@ -730,7 +739,7 @@ namespace mongo {
         @return true if was and update should have happened and the document DNE.  see replset initial sync code.
      */
     bool applyOperation_inlock(const BSONObj& op, bool fromRepl, bool convertUpdateToUpsert) {
-        LOG(6) << "applying op: " << op << endl;
+        LOG(3) << "applying op: " << op << endl;
         bool failedUpdate = false;
 
         OpCounters * opCounters = fromRepl ? &replOpCounters : &globalOpCounters;
@@ -777,7 +786,7 @@ namespace mongo {
                 else {
                     // probably don't need this since all replicated colls have _id indexes now
                     // but keep it just in case
-                    RARELY if ( nsd && !nsd->isCapped() ) { ensureHaveIdIndex(ns); }
+                    RARELY if ( nsd && !nsd->isCapped() ) { ensureHaveIdIndex(ns, false); }
 
                     /* todo : it may be better to do an insert here, and then catch the dup key exception and do update
                               then.  very few upserts will not be inserts...
@@ -794,20 +803,22 @@ namespace mongo {
 
             // probably don't need this since all replicated colls have _id indexes now
             // but keep it just in case
-            RARELY if ( nsd && !nsd->isCapped() ) { ensureHaveIdIndex(ns); }
+            RARELY if ( nsd && !nsd->isCapped() ) { ensureHaveIdIndex(ns, false); }
 
             OpDebug debug;
             BSONObj updateCriteria = op.getObjectField("o2");
             bool upsert = fields[3].booleanSafe() || convertUpdateToUpsert;
-            UpdateResult ur = updateObjectsForReplication(ns,
-                                                          o,
-                                                          updateCriteria,
-                                                          upsert,
-                                                          /*multi*/ false,
-                                                          /*logop*/ false,
-                                                          debug,
-                                                          /*fromMigrate*/ false,
-                                                          QueryPlanSelectionPolicy::idElseNatural() );
+            UpdateResult ur =
+                updateObjectsForReplication(ns,
+                                            o,
+                                            updateCriteria,
+                                            upsert,
+                                            /*multi*/ false,
+                                            /*logop*/ false,
+                                            debug,
+                                            /*fromMigrate*/ false,
+                                            QueryPlanSelectionPolicy::idElseNatural() );
+
             if( ur.num == 0 ) {
                 if( ur.mod ) {
                     if( updateCriteria.nFields() == 1 ) {
@@ -875,6 +886,13 @@ namespace mongo {
         virtual void help( stringstream &help ) const {
             help << "internal (sharding)\n{ applyOps : [ ] , preCondition : [ { ns : ... , q : ... , res : ... } ] }";
         }
+        virtual void addRequiredPrivileges(const std::string& dbname,
+                                           const BSONObj& cmdObj,
+                                           std::vector<Privilege>* out) {
+            ActionSet actions;
+            actions.addAction(ActionType::applyOps);
+            out->push_back(Privilege(AuthorizationManager::SERVER_RESOURCE_NAME, actions));
+        }
         virtual bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
 
             if ( cmdObj.firstElement().type() != Array ) {
@@ -920,13 +938,15 @@ namespace mongo {
             
             BSONObjIterator i( ops );
             BSONArrayBuilder ab;
+            const bool alwaysUpsert = cmdObj.hasField("alwaysUpsert") ?
+                    cmdObj["alwaysUpsert"].trueValue() : true;
             
             while ( i.more() ) {
                 BSONElement e = i.next();
                 const BSONObj& temp = e.Obj();
                 
-                Client::Context ctx( temp["ns"].String() ); // this handles security
-                bool failed = applyOperation_inlock( temp , false );
+                Client::Context ctx(temp["ns"].String());
+                bool failed = applyOperation_inlock(temp, false, alwaysUpsert);
                 ab.append(!failed);
                 if ( failed )
                     errors++;
@@ -943,7 +963,19 @@ namespace mongo {
 
                 string tempNS = str::stream() << dbname << ".$cmd";
 
-                logOp( "c" , tempNS.c_str() , cmdObj.firstElement().wrap() );
+                // TODO: possibly use mutable BSON to remove preCondition field
+                // once it is available
+                BSONObjIterator iter(cmdObj);
+                BSONObjBuilder cmdBuilder;
+
+                while (iter.more()) {
+                    BSONElement elem(iter.next());
+                    if (strcmp(elem.fieldName(), "preCondition") != 0) {
+                        cmdBuilder.append(elem);
+                    }
+                }
+
+                logOp("c", tempNS.c_str(), cmdBuilder.done());
             }
 
             return errors == 0;

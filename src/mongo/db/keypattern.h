@@ -18,12 +18,13 @@
 
 #pragma once
 
+#include "mongo/base/string_data.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
-    class FieldInterval;
+    struct FieldInterval;
     class FieldRangeSet;
 
     /**
@@ -57,7 +58,13 @@ namespace mongo {
          * Returns true if the given fieldname is the name of one element of the (potentially)
          * compound key described by this KeyPattern.
          */
-        bool hasField( const char* fieldname ) const { return _pattern.hasField( fieldname ); }
+        bool hasField( const StringData& fieldname ) const { return _pattern.hasField( fieldname ); }
+
+        /*
+         * Gets the element of this pattern corresponding to the given fieldname.
+         * Returns eoo if none exists.
+         */
+        BSONElement getField( const char* fieldname ) const { return _pattern[ fieldname ]; }
 
         /*
          * Returns true if the key described by this KeyPattern is a prefix of
@@ -67,6 +74,31 @@ namespace mongo {
             return _pattern.isPrefixOf( other.toBSON() );
         }
 
+        /* Takes a BSONObj whose field names are a prefix of the fields in this keyPattern, and
+         * outputs a new bound with MinKey values appended to match the fields in this keyPattern
+         * (or MaxKey values for descending -1 fields). This is useful in sharding for
+         * calculating chunk boundaries when tag ranges are specified on a prefix of the actual
+         * shard key, or for calculating index bounds when the shard key is a prefix of the actual
+         * index used.
+         *
+         * @param makeUpperInclusive If true, then MaxKeys instead of MinKeys will be appended, so
+         * that the output bound will compare *greater* than the bound being extended (note that
+         * -1's in the keyPattern will swap MinKey/MaxKey vals. See examples).
+         *
+         * Examples:
+         * If this keyPattern is {a : 1}
+         *   extendRangeBound( {a : 55}, false) --> {a : 55}
+         *
+         * If this keyPattern is {a : 1, b : 1}
+         *   extendRangeBound( {a : 55}, false) --> {a : 55, b : MinKey}
+         *   extendRangeBound( {a : 55}, true ) --> {a : 55, b : MaxKey}
+         *
+         * If this keyPattern is {a : 1, b : -1}
+         *   extendRangeBound( {a : 55}, false) --> {a : 55, b : MaxKey}
+         *   extendRangeBound( {a : 55}, true ) --> {a : 55, b : MinKey}
+         */
+        BSONObj extendRangeBound( const BSONObj& bound , bool makeUpperInclusive ) const;
+
         /**
          * Returns true if this KeyPattern contains any computed values, (e.g. {a : "hashed"}),
          * and false if this KeyPattern consists of only ascending/descending fields
@@ -74,6 +106,13 @@ namespace mongo {
          * are any patterns that are not a simple list of field names and 1/-1 values.
          */
         bool isSpecial() const;
+
+        /**
+         * Returns true if the quantities stored in this KeyPattern can be used to compute all the
+         * quantities in "other". Useful for determining whether an index based on one KeyPattern
+         * can be used as a covered index for a query based on another.
+         */
+        bool isCoveredBy( const KeyPattern& other ) const;
 
         string toString() const{ return toBSON().toString(); }
 
@@ -91,7 +130,6 @@ namespace mongo {
          *   { a: 1 } --> returns { a : NumberLong("5902408780260971510")  }
          */
         BSONObj extractSingleKey( const BSONObj& doc ) const;
-
 
         /**@param queryConstraints a FieldRangeSet, usually formed from parsing a query
          * @return an ordered list of bounds generated using this KeyPattern and the

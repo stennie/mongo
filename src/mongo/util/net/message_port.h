@@ -105,11 +105,19 @@ namespace mongo {
             return psock->connect( farEnd );
         }
 #ifdef MONGO_SSL
-        /** secures inline */
+        /**
+         * Initiates the TLS/SSL handshake on this MessagingPort.
+         * When this function returns, further communication on this
+         * MessagingPort will be encrypted.
+         */
         void secure( SSLManager * ssl ) {
             psock->secure( ssl );
         }
 #endif
+
+        uint64_t getSockCreationMicroSec() const {
+            return psock->getSockCreationMicroSec();
+        }
 
     private:
         

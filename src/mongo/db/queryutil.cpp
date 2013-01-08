@@ -193,6 +193,12 @@ namespace mongo {
                         }                        
                         vals.insert( temp );
                     }
+                    if ( ie.isNull() ) {
+                        // A null index key will not always match a null query value (eg
+                        // SERVER-4529).  As a result, a field range containing null cannot be an
+                        // exact match representation.
+                        exactMatchesOnly = false;
+                    }
                 }
             }
 
@@ -284,14 +290,27 @@ namespace mongo {
             }
             return;
         }
-        
-        if ( optimize && !isNot && ( e.type() != Array ) ) {
+
+        // Identify simple cases where this FieldRange represents the exact set of BSONElement
+        // values matching the query expression element used to construct the FieldRange.
+
+        if ( // If type bracketing is enabled (see 'optimize' case at the end of this function) ...
+             optimize &&
+             // ... and the operator isn't within a $not clause ...
+             !isNot &&
+             // ... and the operand is of a type that implements exact type bracketing and will be
+             // exactly represented in an index key (eg is not null or an array) ...
+             e.isSimpleType() ) {
             switch( op ) {
+                // ... and the operator is one for which this constructor will determine exact
+                // bounds on the values that match ...
                 case BSONObj::Equality:
                 case BSONObj::LT:
                 case BSONObj::LTE:
                 case BSONObj::GT:
                 case BSONObj::GTE:
+                    // ... then this FieldRange exactly characterizes those documents that match the
+                    // operator.
                     _exactMatchRepresentation = true;
                 default:
                     break;
@@ -426,9 +445,18 @@ namespace mongo {
             log() << "warning: shouldn't get here?" << endl;
             break;
         }
-        case BSONObj::opNEAR:
         case BSONObj::opWITHIN:
-            _special = "2d";
+            _special.add("2d", SpecialIndices::NO_INDEX_REQUIRED);
+            // TODO(hk): make this work w/o an index too.  will require
+            // changing matcher.cpp to parse geojson stuff etc.
+            _special.add("2dsphere", SpecialIndices::INDEX_REQUIRED);
+            break;
+        case BSONObj::opNEAR:
+            _special.add("2d", SpecialIndices::INDEX_REQUIRED);
+            _special.add("2dsphere", SpecialIndices::INDEX_REQUIRED);
+            break;
+        case BSONObj::opGEO_INTERSECTS:
+            _special.add("2dsphere", SpecialIndices::INDEX_REQUIRED);
             break;
         case BSONObj::opEXISTS: {
             if ( !existsSpec ) {
@@ -441,18 +469,38 @@ namespace mongo {
             break;
         }
 
+        // If 'optimize' is set, then bracket the field range by bson type.  For example, if this
+        // FieldRange is constructed with the operator { $gt:5 }, then the lower bound will be 5
+        // at this point but the upper bound will be MaxKey.  If 'optimize' is true, the upper bound
+        // is bracketed to the highest possible bson numeric value.  This is consistent with the
+        // Matcher's $gt implementation.
+
         if ( optimize ) {
             if ( lower.type() != MinKey && upper.type() == MaxKey && lower.isSimpleType() ) { // TODO: get rid of isSimpleType
                 BSONObjBuilder b;
                 b.appendMaxForType( lower.fieldName() , lower.type() );
                 upper = addObj( b.obj() ).firstElement();
+                if ( upper.canonicalType() != lower.canonicalType() ) {
+                    // _exactMatchRepresentation will be set if lower.isSimpleType(), requiring that
+                    // this field range exactly describe the values matching its query operator.  If
+                    // lower's max for type is not of the same canonical type as lower, it is
+                    // assumed to be the lowest value of the next canonical type meaning the upper
+                    // bound should be exclusive.
+                    upperInclusive = false;
+                }
             }
             else if ( lower.type() == MinKey && upper.type() != MaxKey && upper.isSimpleType() ) { // TODO: get rid of isSimpleType
-                if( upper.type() == Date ) 
-                    lowerInclusive = false;
                 BSONObjBuilder b;
                 b.appendMinForType( upper.fieldName() , upper.type() );
                 lower = addObj( b.obj() ).firstElement();
+                if ( lower.canonicalType() != upper.canonicalType() ) {
+                    // _exactMatchRepresentation will be set if upper.isSimpleType(), requiring that
+                    // this field range exactly describe the values matching its query operator.  If
+                    // upper's min for type is not of the same canonical type as upper, it is
+                    // assumed to be the highest value of the previous canonical type meaning the
+                    // lower bound should be exclusive.
+                    lowerInclusive = false;
+                }
             }
         }
 
@@ -463,7 +511,7 @@ namespace mongo {
         _intervals = newIntervals;
         for( vector<BSONObj>::const_iterator i = other._objData.begin(); i != other._objData.end(); ++i )
             _objData.push_back( *i );
-        if ( _special.size() == 0 && other._special.size() )
+        if (_special.empty() && !other._special.empty())
             _special = other._special;
         _exactMatchRepresentation = exactMatchRepresentation;
         // A manipulated FieldRange may no longer be valid within a parent context.
@@ -501,14 +549,14 @@ namespace mongo {
     const FieldRange &FieldRange::intersect( const FieldRange &other, bool singleKey ) {
         // If 'this' FieldRange is universal(), intersect by copying the 'other' range into 'this'.
         if ( universal() ) {
-            string intersectSpecial = !_special.empty() ? _special : other._special;
+            SpecialIndices intersectSpecial = _special.combineWith(other._special);
             *this = other;
             _special = intersectSpecial;
             return *this;
         }
         // Range intersections are not taken for multikey indexes.  See SERVER-958.
         if ( !singleKey && !universal() ) {
-            string intersectSpecial = !_special.empty() ? _special : other._special;
+            SpecialIndices intersectSpecial = _special.combineWith(other._special);
             // Pick 'other' range if it is smaller than or equal to 'this'.
             if ( other <= *this ) {
              	*this = other;
@@ -755,25 +803,24 @@ namespace mongo {
         return buf.str();
     }
 
+
     string FieldRange::toString() const {
         StringBuilder buf;
-        buf << "(FieldRange special: " << _special << " intervals: ";
-        for( vector<FieldInterval>::const_iterator i = _intervals.begin(); i != _intervals.end(); ++i ) {
+        buf << "(FieldRange special: { " << _special.toString() << "} intervals: ";
+        for (vector<FieldInterval>::const_iterator i = _intervals.begin(); i != _intervals.end(); ++i) {
             buf << i->toString() << " ";
         }
         buf << ")";
         return buf.str();
     }
 
-    string FieldRangeSet::getSpecial() const {
-        string s = "";
-        for ( map<string,FieldRange>::const_iterator i=_ranges.begin(); i!=_ranges.end(); i++ ) {
-            if ( i->second.getSpecial().size() == 0 )
-                continue;
-            uassert( 13033 , "can't have 2 special fields" , s.size() == 0 );
-            s = i->second.getSpecial();
+    SpecialIndices FieldRangeSet::getSpecial() const {
+        for (map<string, FieldRange>::const_iterator i = _ranges.begin(); i != _ranges.end(); i++) {
+            if (!i->second.getSpecial().empty()) {
+                return i->second.getSpecial();
+            }
         }
-        return s;
+        return SpecialIndices();
     }
 
     /**
@@ -1102,9 +1149,31 @@ namespace mongo {
         }
     }
 
+    /**
+     * @return true if @param range is universal or can be easily identified as a reverse universal
+     * range (see FieldRange::reverse()).
+     */
+    static bool universalOrReverseUniversalRange( const FieldRange& range ) {
+        if ( range.universal() ) {
+            return true;
+        }
+        if ( range.intervals().size() != 1 ) {
+            return false;
+        }
+        if ( !range.min().valuesEqual( maxKey.firstElement() ) ) {
+            return false;
+        }
+        if ( !range.max().valuesEqual( minKey.firstElement() ) ) {
+            return false;
+        }
+        return true;
+    }
+
     FieldRangeVector::FieldRangeVector( const FieldRangeSet &frs, const IndexSpec &indexSpec,
-                                       int direction )
-    :_indexSpec( indexSpec ), _direction( direction >= 0 ? 1 : -1 ) {
+                                        int direction ) :
+        _indexSpec( indexSpec ),
+        _direction( direction >= 0 ? 1 : -1 ),
+        _hasAllIndexedRanges( true ) {
         verify(  frs.matchPossibleForIndex( _indexSpec.keyPattern ) );
         _queries = frs._queries;
         BSONObjIterator i( _indexSpec.keyPattern );
@@ -1146,6 +1215,7 @@ namespace mongo {
                               topFieldElemMatchContexts[ topField ].rawdata() ) {
                     // ... this field's parsed range cannot be used.
                     range = &frs.universalRange();
+                    _hasAllIndexedRanges = false;
                 }
             }
 
@@ -1164,22 +1234,115 @@ namespace mongo {
                 size() < MAX_IN_COMBINATIONS );
     }    
 
+    bool FieldRangeVector::isSingleInterval() const {
+        size_t i = 0;
+
+        // Skip all equality ranges.
+        while( i < _ranges.size() && _ranges[ i ].equality() ) {
+            ++i;
+        }
+
+        // If there are no ranges left ...
+        if ( i >= _ranges.size() ) {
+            // ... then all ranges are equalities.
+            return true;
+        }
+
+        // If the first non equality range does not consist of a single interval ...
+        if ( _ranges[ i ].intervals().size() != 1 ) {
+            // ... then the full FieldRangeVector does not consist of a single interval.
+            return false;
+        }
+        ++i;
+
+        while( i < _ranges.size() ) {
+            // If a range after the first non equality is not universal ...
+            if ( !universalOrReverseUniversalRange( _ranges[ i ] ) ) {
+                // ... then the full FieldRangeVector does not consist of a single interval.
+                return false;
+            }
+            ++i;
+        }
+
+        // The FieldRangeVector consists of zero or more equalities, then zero or one inequality
+        // with a single interval, then zero or more universal ranges.
+        return true;
+    }
+
     BSONObj FieldRangeVector::startKey() const {
         BSONObjBuilder b;
-        for( vector<FieldRange>::const_iterator i = _ranges.begin(); i != _ranges.end(); ++i ) {
+        BSONObjIterator keys( _indexSpec.keyPattern );
+        vector<FieldRange>::const_iterator i = _ranges.begin();
+        for( ; i != _ranges.end(); ++i, ++keys ) {
+            // Append lower bounds until an exclusive bound is found.
             const FieldInterval &fi = i->intervals().front();
             b.appendAs( fi._lower._bound, "" );
+            if ( !fi._lower._inclusive ) {
+                ++i;
+                ++keys;
+                break;
+            }
+        }
+        for( ; i != _ranges.end(); ++i, ++keys ) {
+            // After the first exclusive bound is found, use extreme values for subsequent fields.
+            // For example, on index { a:1, b:1 } with query { a:{ $gt: 5 } } the start key is
+            // { '':5, '':MaxKey }.
+            bool forward = ( ( (*keys).number() >= 0 ? 1 : -1 ) * _direction > 0 );
+            if ( forward ) {
+                b.appendMaxKey( "" );
+            }
+            else {
+                b.appendMinKey( "" );
+            }
         }
         return b.obj();
     }
 
+    bool FieldRangeVector::startKeyInclusive() const {
+        for( vector<FieldRange>::const_iterator i = _ranges.begin(); i != _ranges.end(); ++i ) {
+            if( !i->intervals().front()._lower._inclusive ) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     BSONObj FieldRangeVector::endKey() const {
         BSONObjBuilder b;
-        for( vector<FieldRange>::const_iterator i = _ranges.begin(); i != _ranges.end(); ++i ) {
+        BSONObjIterator keys( _indexSpec.keyPattern );
+        vector<FieldRange>::const_iterator i = _ranges.begin();
+        for( ; i != _ranges.end(); ++i, ++keys ) {
+            // Append upper bounds until an exclusive bound is found.
             const FieldInterval &fi = i->intervals().back();
             b.appendAs( fi._upper._bound, "" );
+            if ( !fi._upper._inclusive ) {
+                ++i;
+                ++keys;
+                break;
+            }
+        }
+        for( ; i != _ranges.end(); ++i, ++keys ) {
+            // After the first exclusive bound is found, use extreme values for subsequent fields.
+            // For example, on index { a:1, b:1 } with query { a:{ $lt: 5 } } the end key is
+            // { '':5, '':MinKey }.
+            bool forward = ( ( (*keys).number() >= 0 ? 1 : -1 ) * _direction > 0 );
+            if ( forward ) {
+                b.appendMinKey( "" );
+            }
+            else {
+                b.appendMaxKey( "" );
+            }
         }
         return b.obj();
+    }
+
+    bool FieldRangeVector::endKeyInclusive() const {
+        for( vector<FieldRange>::const_iterator i = _ranges.begin(); i != _ranges.end(); ++i ) {
+            if( !i->intervals().front()._upper._inclusive ) {
+                return false;
+            }
+        }
+        return true;
     }
 
     BSONObj FieldRangeVector::obj() const {
@@ -1205,37 +1368,6 @@ namespace mongo {
         }
         return *ret;
     }
-
-    BSONObj FieldRangeSet::simplifiedQuery( const BSONObj &_fields ) const {
-        BSONObj fields = _fields;
-        if ( fields.isEmpty() ) {
-            BSONObjBuilder b;
-            for( map<string,FieldRange>::const_iterator i = _ranges.begin(); i != _ranges.end(); ++i ) {
-                b.append( i->first, 1 );
-            }
-            fields = b.obj();
-        }
-        BSONObjBuilder b;
-        BSONObjIterator i( fields );
-        while( i.more() ) {
-            BSONElement e = i.next();
-            const char *name = e.fieldName();
-            const FieldRange &eRange = range( name );
-            verify( !eRange.empty() );
-            if ( eRange.equality() )
-                b.appendAs( eRange.min(), name );
-            else if ( !eRange.universal() ) {
-                BSONObj o;
-                BSONObjBuilder c;
-                c.appendAs( eRange.min(), eRange.minInclusive() ? "$gte" : "$gt" );
-                c.appendAs( eRange.max(), eRange.maxInclusive() ? "$lte" : "$lt" );
-                o = c.obj();
-                b.append( name, o );
-            }
-        }
-        return b.obj();
-    }
-
 
     bool FieldRangeSet::isPointIntervalSet( const string& fieldname ) const {
 
@@ -1322,10 +1454,6 @@ namespace mongo {
                     ).jsonString();
     }
     
-    BSONObj FieldRangeSetPair::simplifiedQueryForIndex( NamespaceDetails *d, int idxNo, const BSONObj &keyPattern ) const {
-        return frsForIndex( d, idxNo ).simplifiedQuery( keyPattern );
-    }    
-    
     void FieldRangeSetPair::assertValidIndex( const NamespaceDetails *d, int idxNo ) const {
         massert( 14048, "FieldRangeSetPair invalid index specified", idxNo >= 0 && idxNo < d->nIndexes );   
     }
@@ -1337,8 +1465,8 @@ namespace mongo {
             return _multiKey;
         }
         return nsd->isMultikey( idxNo ) ? _multiKey : _singleKey;
-    }    
-        
+    }
+
     bool FieldRangeVector::matchesElement( const BSONElement &e, int i, bool forward ) const {
         bool eq;
         int l = matchingLowElement( e, i, forward, eq );
@@ -1614,26 +1742,6 @@ namespace mongo {
         return advancePast( i );
     }
 
-    /**
-     * @return true if @param range is universal or can be easily identified as a reverse universal
-     * range (see FieldRange::reverse()).
-     */
-    static bool universalOrReverseUniversalRange( const FieldRange& range ) {
-        if ( range.universal() ) {
-            return true;
-        }
-        if ( range.intervals().size() != 1 ) {
-            return false;
-        }
-        if ( !range.min().valuesEqual( maxKey.firstElement() ) ) {
-            return false;
-        }
-        if ( !range.max().valuesEqual( minKey.firstElement() ) ) {
-            return false;
-        }
-        return true;
-    }
-
     int FieldRangeVectorIterator::endNonUniversalRanges() const {
         int i = _v._ranges.size() - 1;
         while( i > -1 && universalOrReverseUniversalRange( _v._ranges[ i ] ) ) {
@@ -1684,14 +1792,13 @@ namespace mongo {
         return _upperCmp._cmp;
     }
 
-    OrRangeGenerator::OrRangeGenerator( const char *ns, const BSONObj &query , bool optimize )
-    : _baseSet( ns, query, optimize ), _orFound() {
-        
+    OrRangeGenerator::OrRangeGenerator(const char *ns, const BSONObj &query, bool optimize)
+                                      : _baseSet(ns, query, optimize), _orFound() {
         BSONObjIterator i( _baseSet.originalQuery() );
         
-        while( i.more() ) {
+        while (i.more()) {
             BSONElement e = i.next();
-            if ( strcmp( e.fieldName(), "$or" ) == 0 ) {
+            if (strcmp(e.fieldName(), "$or") == 0) {
                 uassert( 13262, "$or requires nonempty array", e.type() == Array && e.embeddedObject().nFields() > 0 );
                 BSONObjIterator j( e.embeddedObject() );
                 while( j.more() ) {

@@ -18,7 +18,10 @@
 
 #include "pch.h"
 
+#include <algorithm> // for max
+
 #include "mongo/db/oplog.h"
+#include "mongo/db/ops/field_ref.h"
 #include "mongo/db/jsobjmanipulator.h"
 #include "mongo/db/pdfile.h"
 #include "mongo/util/mongoutils/str.h"
@@ -31,7 +34,8 @@
 namespace mongo {
 
     const char* Mod::modNames[] = { "$inc", "$set", "$push", "$pushAll", "$pull", "$pullAll" , "$pop", "$unset" ,
-                                    "$bitand" , "$bitor" , "$bit" , "$addToSet", "$rename", "$rename"
+                                    "$bitand" , "$bitor" , "$bit" , "$addToSet", "$rename", "$rename" ,
+                                    "$setOnInsert"
                                   };
     unsigned Mod::modNamesNum = sizeof(Mod::modNames)/sizeof(char*);
 
@@ -111,6 +115,12 @@ namespace mongo {
             break;
         }
 
+        case SET_ON_INSERT:
+            // $setOnInsert on an existing field should be a no-op (e.g., dontApply should be
+            // set for it), so we should never get here.
+            verify(false);
+            break;
+
         case UNSET: {
             appendUnset( builder );
             break;
@@ -118,24 +128,143 @@ namespace mongo {
 
         case PUSH: {
             uassert( 10131 ,  "$push can only be applied to an array" , in.type() == Array );
+
+            //
+            // We can be in a single element push case, a "push all" case, or a "push all" case
+            // with a slice requirement (ie, a "push to size"). In each of these, we decide
+            // differently how much of the existing- and of the parameter-array to copy to the
+            // final object.
+            //
+
+            // Start the resulting array's builder.
             BSONArrayBuilder bb( builder.subarrayStart( shortFieldName ) );
-            BSONObjIterator i( in.embeddedObject() );
-            while ( i.more() ) {
-                bb.append( i.next() );
+
+            // If in the single element push case, we'll copy all elements of the existing
+            // array and add the new one.
+            if ( ! isEach() ) {
+                BSONObjIterator i( in.embeddedObject() );
+                while ( i.more() ) {
+                    bb.append( i.next() );
+                }
+                bb.append( elt );
+
+                // We don't want to log a positional $set for which the '_checkForAppending' test
+                // won't pass. If we're in that case, fall back to non-optimized logging.
+                if ( (elt.type() == Object && elt.embeddedObject().okForStorage()) ||
+                     (elt.type() != Object) ) {
+                    ms.fixedOpName = "$set";
+                    ms.forcePositional = true;
+                    ms.position = bb.arrSize() - 1;
+                    bb.done();
+                }
+                else {
+                    ms.fixedOpName = "$set";
+                    ms.forceEmptyArray = true;
+                    ms.fixedArray = BSONArray( bb.done().getOwned() );
+                }
             }
 
-            bb.append( elt );
+            // If we're in the "push all" case, we'll copy all element of both the existing and
+            // parameter arrays.
+            else if ( isEach() && ! isSliceOnly() && ! isSliceAndSort() ) {
+                BSONObjIterator i( in.embeddedObject() );
+                while ( i.more() ) {
+                    bb.append( i.next() );
+                }
+                BSONObjIterator j( elt.embeddedObject() );
+                while ( j.more() ) {
+                    bb.append( j.next() );
+                }
 
-            // We don't want to log a positional $set for which the '_checkForAppending' test
-            // won't pass. If we're in that case, fall back to non-optimized logging.
-            if ( (elt.type() == Object && elt.embeddedObject().okForStorage()) ||
-                 (elt.type() != Object) ) {
                 ms.fixedOpName = "$set";
-                ms.forcePositional = true;
-                ms.position = bb.arrSize() - 1;
-                bb.done();
+                ms.forceEmptyArray = true;
+                ms.fixedArray = BSONArray( bb.done().getOwned() );
             }
+
+            // If we're in the "push all" case with slice, we have to decide how much of each
+            // of the existing and parameter arrays to copy to the final object.
+            else if ( isSliceOnly() ) {
+                long long slice = getSlice();
+                BSONObj eachArray = getEach();
+                long long arraySize = in.embeddedObject().nFields();
+                long long eachArraySize = eachArray.nFields();
+
+                // Zero slice is equivalent to resetting the array in the final object, so
+                // we won't copy anything.
+                if (slice == 0) {
+                    // no-op
+                }
+
+                // If the parameter array alone is larger than the slice, then only copy
+                // object from that array.
+                else if (slice <= eachArraySize) {
+                    long long skip = eachArraySize - slice;
+                    BSONObjIterator j( getEach() );
+                    while ( j.more() ) {
+                        if ( skip-- > 0 ) {
+                            j.next();
+                            continue;
+                        }
+                        bb.append( j.next() );
+                    }
+                }
+
+                // If the parameter array is not sufficient to fill the slice, then some (or all)
+                // the elements from the existing array will be copied too.
+                else {
+                    long long skip = std::max(0LL, arraySize - (slice - eachArraySize) );
+                    BSONObjIterator i( in.embeddedObject() );
+                    while ( i.more() ) {
+                        if (skip-- > 0) {
+                            i.next();
+                            continue;
+                        }
+                        bb.append( i.next() );
+                    }
+                    BSONObjIterator j( getEach() );
+                    while ( j.more() ) {
+                        bb.append( j.next() );
+                    }
+                }
+
+                ms.fixedOpName = "$set";
+                ms.forceEmptyArray = true;
+                ms.fixedArray = BSONArray( bb.done().getOwned() );
+            }
+
+            // If we're in the "push all" case ($push with a $each) with sort, we have to
+            // concatenate the existing array with the $each array, sort the result, and then
+            // decide how much of each of the resulting work area to copy to the final object.
             else {
+                long long slice = getSlice();
+                BSONObj sortPattern = getSort();
+
+                // Zero slice is equivalent to resetting the array in the final object, so
+                // we only go into sorting if there is anything to sort.
+                if ( slice > 0 ) {
+                    vector<BSONObj> workArea;
+                    BSONObjIterator i( in.embeddedObject() );
+                    while ( i.more() ) {
+                        workArea.push_back( i.next().Obj() );
+                    }
+                    BSONObjIterator j( getEach() );
+                    while ( j.more() ) {
+                        workArea.push_back( j.next().Obj() );
+                    }
+                    sort( workArea.begin(), workArea.end(), ProjectKeyCmp( sortPattern ) );
+
+                    long long skip = std::max( 0LL,
+                                               (long long)workArea.size() - slice );
+                    for ( vector<BSONObj>::iterator it = workArea.begin();
+                         it != workArea.end();
+                         ++it ) {
+                        if ( skip-- > 0 ) {
+                            continue;
+                        }
+                        bb.append( *it );
+                    }
+                }
+
                 ms.fixedOpName = "$set";
                 ms.forceEmptyArray = true;
                 ms.fixedArray = BSONArray( bb.done().getOwned() );
@@ -178,12 +307,16 @@ namespace mongo {
             else {
 
                 bool found = false;
-
+                int pos = 0;
+                int count = 0;
                 while ( i.more() ) {
                     BSONElement cur = i.next();
                     bb.append( cur );
-                    if ( elt.woCompare( cur , false ) == 0 )
+                    if ( elt.woCompare( cur , false ) == 0 ) {
                         found = true;
+                        pos = count;
+                    }
+                    count++;
                 }
 
                 if ( !found ) {
@@ -196,7 +329,7 @@ namespace mongo {
                      (elt.type() != Object) ) {
                     ms.fixedOpName = "$set";
                     ms.forcePositional = true;
-                    ms.position = bb.arrSize() - 1;
+                    ms.position = found ? pos : bb.arrSize() - 1;
                     bb.done();
                 }
                 else {
@@ -407,6 +540,24 @@ namespace mongo {
             ModState& ms = *mss->_mods[i->first];
 
             const Mod& m = i->second;
+
+            // Check for any positional operators that have not been replaced with a numeric field
+            // name (from a query match element).
+            // Only perform this positional operator validation in 'strictApply' mode.  When
+            // replicating from a legacy primary that does not implement this validation, the
+            // secondary bypasses validation and remains consistent with the primary.
+            if ( m.strictApply ) {
+                FieldRef fieldRef;
+                fieldRef.parse( m.fieldName );
+                StringData positionalOpField( "$" );
+                for( size_t i = 0; i < fieldRef.numParts(); ++i ) {
+                     uassert( 16650,
+                              "Cannot apply the positional operator without a corresponding query "
+                              "field containing an array.",
+                              fieldRef.getPart( i ).compare( positionalOpField ) != 0 );
+                }
+            }
+
             BSONElement e = obj.getFieldDotted(m.fieldName);
 
             ms.m = &m;
@@ -462,11 +613,34 @@ namespace mongo {
                                          m.elt.valuesize() == e.valuesize() );
                 break;
 
+            case Mod::SET_ON_INSERT:
+                // In-place-ness was set before on the general test for e.eoo() above this
+                // switch. Just for documentation, this is what we'd like for $setOnInsert.
+                // mss->amIInPlacePossible( ! e.eoo() );
+
+                // If the element exists, $setOnInsert becomes a no-op.
+                if ( ! e.eoo() ) {
+                    ms.dontApply = true;
+                }
+                break;
+
             case Mod::PUSH:
             case Mod::PUSH_ALL:
                 uassert( 10141,
                          "Cannot apply $push/$pushAll modifier to non-array",
                          e.type() == Array || e.eoo() );
+
+                // Currently, we require the base array of a $sort to be made of
+                // objects (as opposed to base types).
+                if ( !e.eoo() && m.isEach() && m.isSliceAndSort() ) {
+                    BSONObjIterator i( e.embeddedObject() );
+                    while ( i.more() ) {
+                        BSONElement arrayItem = i.next();
+                        uassert( 16638,
+                                 "$sort can only be applied to an array of objects",
+                                 arrayItem.type() == Object );
+                    }
+                }
                 mss->amIInPlacePossible( false );
                 break;
 
@@ -680,6 +854,10 @@ namespace mongo {
                     BSONElementManipulator( m.old ).replaceTypeAndValue( m.m->elt );
                 break;
 
+            case Mod::SET_ON_INSERT:
+                // this should have been handled by prepare
+                break;
+
             default:
                 uassert( 13478 ,  "can't apply mod in place - shouldn't have gotten here" , 0 );
             }
@@ -812,9 +990,20 @@ namespace mongo {
                                    << " not: " << e.type() );
                     }
                     else {
-                        // skip both as we're not applying this mod
+                        // Since we're not applying the mod, we keep what was there before
+                        builder.append( e );
+
+                        // Skip both as we're not applying this mod. Note that we'll advance
+                        // the iterator on the mod side for all the mods that are under the
+                        // root we are now.
                         e = es.next();
                         m++;
+                        while ( m != mend &&
+                                ( compareDottedFieldNames( m->second->m->fieldName,
+                                                           field,
+                                                           lexNumCmp ) == LEFT_SUBFIELD ) ) {
+                            m++;
+                        }
                         continue;
                     }
                 }
@@ -836,6 +1025,11 @@ namespace mongo {
                     // inc both as we handled both
                     e = es.next();
                     m++;
+                    while ( m != mend &&
+                            ( compareDottedFieldNames( m->second->m->fieldName , field , lexNumCmp ) ==
+                              LEFT_SUBFIELD ) ) {
+                        m++;
+                    }
                 }
                 else {
                     massert( 16069 , "ModSet::createNewFromMods - "
@@ -911,7 +1105,7 @@ namespace mongo {
                     // we have something like { x : { $gt : 5 } }
                     // this can be a query piece
                     // or can be a dbref or something
-                    
+
                     int op = e.embeddedObject().firstElement().getGtLtOp( -1 );
                     if ( op >= 0 ) {
                         // this means this is a $gt type filter, so don't make part of the new object
@@ -992,6 +1186,87 @@ namespace mongo {
                 uassert( 10153,
                          "Modifier $pushAll/pullAll allowed for arrays only",
                          f.type() == Array || ( op != Mod::PUSH_ALL && op != Mod::PULL_ALL ) );
+
+                // Check whether $each, $slice, and $sort syntax for $push is correct.
+                if ( ( op == Mod::PUSH ) && ( f.type() == Object ) ) {
+                    BSONObj pushObj = f.embeddedObject();
+                    if ( pushObj.nFields() > 0 &&
+                         strcmp(pushObj.firstElement().fieldName(), "$each") == 0 ) {
+                        uassert( 16564,
+                                 "$each term needs to occur alone (or with $slice/$sort)",
+                                 pushObj.nFields() <= 3 );
+                        uassert( 16565,
+                                 "$each requires an array value",
+                                 pushObj.firstElement().type() == Array );
+
+                        // If both $slice and $sort are present, they may be switched.
+                        if ( pushObj.nFields() > 1 ) {
+                            BSONObjIterator i( pushObj );
+                            i.next();
+
+                            bool seenSlice = false;
+                            bool seenSort = false;
+                            while ( i.more() ) {
+                                BSONElement nextElem = i.next();
+
+                                if ( str::equals( nextElem.fieldName(), "$slice" ) ) {
+                                    uassert( 16567, "$slice appeared twice", !seenSlice);
+                                    seenSlice = true;
+                                    uassert( 16568,
+                                             "$slice value must be a numeric integer",
+                                             nextElem.type() == NumberInt ||
+                                             nextElem.type() == NumberLong ||
+                                             (nextElem.type() == NumberDouble &&
+                                              nextElem.numberDouble() ==
+                                              (long long)nextElem.numberDouble() ) );
+                                    uassert( 16640,
+                                             "$slice value must be negative or zero",
+                                             nextElem.number() <= 0 );
+                                }
+                                else if ( str::equals( nextElem.fieldName(), "$sort" ) ) {
+                                    uassert( 16647, "$sort appeared twice", !seenSort );
+                                    seenSort = true;
+                                    uassert( 16648,
+                                             "$sort component of $push must be an object",
+                                             nextElem.type() == Object );
+
+                                    BSONObjIterator j( nextElem.embeddedObject() );
+                                    while ( j.more() ) {
+                                        BSONElement fieldSortElem = j.next();
+                                        uassert( 16641,
+                                                 "$sort elements' values  must either 1 or -1",
+                                                 ( fieldSortElem.type() == NumberInt ||
+                                                   fieldSortElem.type() == NumberLong ||
+                                                   ( fieldSortElem.type() == NumberDouble &&
+                                                     fieldSortElem.numberDouble() ==
+                                                     (long long) fieldSortElem.numberDouble() ) ) &&
+                                                 fieldSortElem.Number()*fieldSortElem.Number()
+                                                 == 1.0);
+                                    }
+
+                                    // Finally, check if the $each is made of objects (as opposed
+                                    // to basic types). Currently, $sort only supports operating
+                                    // on arrays of objects.
+                                    BSONObj eachArray = pushObj.firstElement().embeddedObject();
+                                    BSONObjIterator k( eachArray );
+                                    while ( k.more() ) {
+                                        BSONElement eachItem = k.next();
+                                        uassert( 16642,
+                                                 "$sort requires $each to be an array of objects",
+                                                 eachItem.type() == Object );
+                                    }
+                                }
+                                else {
+                                    uasserted( 16643,
+                                               "$each term takes only $slice (and optionally "
+                                               "$sort) as complements" );
+                                }
+                            }
+
+                            uassert( 16644, "cannot have a $sort without a $slice", seenSlice );
+                        }
+                    }
+                }
 
                 if ( op == Mod::RENAME_TO ) {
                     uassert( 13494, "$rename target must be a string", f.type() == String );

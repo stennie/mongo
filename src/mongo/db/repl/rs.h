@@ -47,11 +47,12 @@
 
 namespace mongo {
 
-    struct HowToFixUp;
-    struct Target;
+    class Cloner;
     class DBClientConnection;
-    class ReplSetImpl;
+    struct HowToFixUp;
     class OplogReader;
+    class ReplSetImpl;
+    struct Target;
     extern bool replSet; // true if using repl sets
     extern class ReplSet *theReplSet; // null until initialized
     extern Tee *rsLog;
@@ -76,6 +77,9 @@ namespace mongo {
 
         bool potentiallyHot() const { return _config.potentiallyHot(); } // not arbiter, not priority 0
         void summarizeMember(stringstream& s) const;
+        // If we could sync from this member.  This doesn't tell us anything about the quality of
+        // this member, just if they are a possible sync target.
+        bool syncable() const;
 
     private:
         friend class ReplSetImpl;
@@ -146,8 +150,6 @@ namespace mongo {
         void associateSlave(const BSONObj& rid, const int memberId);
         void updateSlave(const mongo::OID& id, const OpTime& last);
     };
-
-    struct Target;
 
     class Consensus {
         ReplSetImpl &rs;
@@ -334,11 +336,14 @@ namespace mongo {
         OpTime lastOpTimeWritten;
         long long lastH; // hash we use to make sure we are reading the right flow of ops and aren't on an out-of-date "fork"
         bool forceSyncFrom(const string& host, string& errmsg, BSONObjBuilder& result);
+        // Check if the current sync target is suboptimal. This must be called while holding a mutex
+        // that prevents the sync source from changing.
+        bool shouldChangeSyncTarget(const OpTime& target) const;
 
         /**
          * Find the closest member (using ping time) with a higher latest optime.
          */
-        Member* getMemberToSyncTo();
+        const Member* getMemberToSyncTo();
         void veto(const string& host, unsigned secs=10);
         bool gotForceSync();
         void goStale(const Member* m, const BSONObj& o);
@@ -501,7 +506,8 @@ namespace mongo {
         friend class Consensus;
 
     private:
-        bool _syncDoInitialSync_clone( const char *master, const list<string>& dbs , bool dataPass );
+        bool _syncDoInitialSync_clone(Cloner &cloner, const char *master,
+                                      const list<string>& dbs, bool dataPass);
         bool _syncDoInitialSync_applyToHead( replset::SyncTail& syncer, OplogReader* r ,
                                              const Member* source, const BSONObj& lastOp,
                                              BSONObj& minValidOut);
@@ -543,8 +549,17 @@ namespace mongo {
         void syncRollback(OplogReader& r);
         void syncThread();
         const OpTime lastOtherOpTime() const;
+
+        /**
+         * When a member reaches its minValid optime it is in a consistent state.  Thus, minValid is
+         * set as the last step in initial sync (if no minValid is set, this indicates that initial
+         * sync is necessary). It is also used during "normal" sync: the last op in each batch is
+         * used to set minValid, to indicate that we are in a consistent state when the batch has
+         * been fully applied.
+         */
         static void setMinValid(BSONObj obj);
-        
+        static OpTime getMinValid();
+
         int oplogVersion;
     private:
         IndexPrefetchConfig _indexPrefetchConfig;
@@ -626,22 +641,6 @@ namespace mongo {
         virtual LockType locktype() const { return NONE; }
         virtual void help( stringstream &help ) const { help << "internal"; }
 
-        /**
-         * Some replica set commands call this and then call check(). This is
-         * intentional, as they might do things before theReplSet is initialized
-         * that still need to be checked for auth.
-         */
-        bool checkAuth(string& errmsg, BSONObjBuilder& result) {
-            if( !noauth ) {
-                AuthenticationInfo *ai = cc().getAuthenticationInfo();
-                if (!ai->isAuthorizedForLock("admin", locktype())) {
-                    errmsg = "replSet command unauthorized";
-                    return false;
-                }
-            }
-            return true;
-        }
-
         bool check(string& errmsg, BSONObjBuilder& result) {
             if( !replSet ) {
                 errmsg = "not running with --replSet";
@@ -660,7 +659,7 @@ namespace mongo {
                 return false;
             }
 
-            return checkAuth(errmsg, result);
+            return true;
         }
     };
 

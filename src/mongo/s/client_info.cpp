@@ -17,6 +17,9 @@
  */
 
 #include "pch.h"
+
+#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/auth_external_state_s.h"
 #include "server.h"
 #include "../util/scopeguard.h"
 #include "../db/commands.h"
@@ -29,18 +32,17 @@
 #include "request.h"
 #include "config.h"
 #include "chunk.h"
-#include "stats.h"
 #include "cursors.h"
 #include "grid.h"
 #include "s/writeback_listener.h"
+#include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
-    ClientInfo::ClientInfo() {
+    ClientInfo::ClientInfo(AbstractMessagingPort* messagingPort) : ClientBasic(messagingPort) {
         _cur = &_a;
         _prev = &_b;
         _autoSplitOk = true;
-        newRequest();
     }
 
     ClientInfo::~ClientInfo() {
@@ -70,16 +72,40 @@ namespace mongo {
         _cur = _prev;
         _prev = temp;
         _cur->clear();
+        getAuthorizationManager()->startRequest();
     }
 
-    ClientInfo * ClientInfo::get() {
+    ClientInfo* ClientInfo::create(AbstractMessagingPort* messagingPort) {
         ClientInfo * info = _tlInfo.get();
-        if ( ! info ) {
-            info = new ClientInfo();
-            _tlInfo.reset( info );
-            info->newRequest();
-        }
+        massert(16472, "A ClientInfo already exists for this thread", !info);
+        info = new ClientInfo(messagingPort);
+        info->setAuthorizationManager(new AuthorizationManager(new AuthExternalStateMongos()));
+        _tlInfo.reset( info );
+        info->newRequest();
         return info;
+    }
+
+    ClientInfo * ClientInfo::get(AbstractMessagingPort* messagingPort) {
+        ClientInfo * info = _tlInfo.get();
+        if (!info) {
+            info = create(messagingPort);
+        }
+        massert(16483,
+                mongoutils::str::stream() << "AbstractMessagingPort was provided to ClientInfo::get"
+                        << " but differs from the one stored in the current ClientInfo object. "
+                        << "Current ClientInfo messaging port "
+                        << (info->port() ? "is not" : "is")
+                        << " NULL",
+                messagingPort == NULL || messagingPort == info->port());
+        return info;
+    }
+
+    bool ClientInfo::exists() {
+        return _tlInfo.get();
+    }
+
+    bool ClientBasic::hasCurrent() {
+        return ClientInfo::exists();
     }
 
     ClientBasic* ClientBasic::getCurrent() {
@@ -92,7 +118,7 @@ namespace mongo {
         _lastAccess = 0;
     }
 
-    void ClientInfo::_addWriteBack( vector<WBInfo>& all , const BSONObj& gle ) {
+    void ClientInfo::_addWriteBack( vector<WBInfo>& all, const BSONObj& gle, bool fromLastOperation ) {
         BSONElement w = gle["writeback"];
 
         if ( w.type() != jstOID )
@@ -109,10 +135,12 @@ namespace mongo {
         if ( gle["instanceIdent"].type() == String )
             ident = gle["instanceIdent"].String();
 
-        all.push_back( WBInfo( WriteBackListener::ConnectionIdent( ident , cid.numberLong() ) , w.OID() ) );
+        all.push_back( WBInfo( WriteBackListener::ConnectionIdent( ident , cid.numberLong() ),
+                               w.OID(),
+                               fromLastOperation ) );
     }
 
-    vector<BSONObj> ClientInfo::_handleWriteBacks( vector<WBInfo>& all , bool fromWriteBackListener ) {
+    vector<BSONObj> ClientInfo::_handleWriteBacks( const vector<WBInfo>& all , bool fromWriteBackListener ) {
         vector<BSONObj> res;
 
         if ( all.size() == 0 )
@@ -190,7 +218,7 @@ namespace mongo {
                 conn.done();
             }
 
-            _addWriteBack( writebacks , res );
+            _addWriteBack( writebacks, res, true );
 
             LOG(4) << "gathering writebacks from " << sinceLastGetError().size() << " hosts for"
                    << " gle (" << theShard << ")" << endl;
@@ -206,7 +234,7 @@ namespace mongo {
                 try {
                     ShardConnection conn( temp , "" );
                     ON_BLOCK_EXIT_OBJ( conn, &ShardConnection::done );
-                    _addWriteBack( writebacks , conn->getLastErrorDetailed() );
+                    _addWriteBack( writebacks, conn->getLastErrorDetailed(), false );
 
                 }
                 catch( std::exception &e ){
@@ -232,10 +260,25 @@ namespace mongo {
                     // since that's the current write
                     // but we block for all
                     verify( v.size() >= 1 );
-                    result.appendElements( v[0] );
-                    result.appendElementsUnique( res );
-                    result.append( "writebackGLE" , v[0] );
-                    result.append( "initialGLEHost" , theShard );
+
+                    if ( res["writebackSince"].numberInt() > 0 ) {
+                        // got writeback from older op
+                        // ignore the result from it, just needed to wait
+                        result.appendElements( res );
+                    }
+                    else if ( writebacks[0].fromLastOperation ) {
+                        result.appendElements( v[0] );
+                        result.appendElementsUnique( res );
+                        result.append( "writebackGLE" , v[0] );
+                        result.append( "initialGLEHost" , theShard );
+                        result.append( "initialGLE", res );
+                    }
+                    else {
+                        // there was a writeback
+                        // but its from an old operations
+                        // so all that's important is that we block, not that we return stats
+                        result.appendElements( res );
+                    }
                 }
             }
             else {
@@ -288,7 +331,7 @@ namespace mongo {
                 return false;
             }
 
-            _addWriteBack( writebacks, res );
+            _addWriteBack( writebacks, res, true );
 
             string temp = DBClientWithCommands::getLastErrorString( res );
             if ( (*conn)->type() != ConnectionString::SYNC && ( ok == false || temp.size() ) ) {
@@ -327,7 +370,7 @@ namespace mongo {
 
             ShardConnection conn( temp , "" );
             try {
-                _addWriteBack( writebacks, conn->getLastErrorDetailed() );
+                _addWriteBack( writebacks, conn->getLastErrorDetailed(), false );
             }
             catch( std::exception &e ){
                 warning() << "could not clear last error from a shard " << temp << causedBy( e ) << endl;

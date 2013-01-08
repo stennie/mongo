@@ -16,21 +16,21 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/platform/random.h"
+#include "mongo/bson/bson_validate.h"
 
 namespace {
-    
+
     using namespace mongo;
 
     TEST(BSONValidate, Basic) {
         BSONObj x;
         ASSERT_TRUE( x.valid() );
-        
+
         x = BSON( "x" << 1 );
         ASSERT_TRUE( x.valid() );
     }
 
     TEST(BSONValidate, RandomData) {
-        
         PseudoRandom r(17);
 
         int numValid = 0;
@@ -39,15 +39,15 @@ namespace {
 
         for ( int i=0; i<numToRun; i++ ) {
             int size = 1234;
-            
+
             char* x = new char[size];
             int* xx = reinterpret_cast<int*>(x);
             xx[0] = size;
-            
+
             for ( int i=4; i<size; i++ ) {
                 x[i] = r.nextInt32( 255 );
             }
-            
+
             x[size-1] = 0;
 
             BSONObj o( x );
@@ -57,19 +57,24 @@ namespace {
             if ( o.valid() ) {
                 numValid++;
                 jsonSize += o.jsonString().size();
+                ASSERT( validateBSON( o.objdata(), o.objsize() ).isOK() );
+            }
+            else {
+                ASSERT( !validateBSON( o.objdata(), o.objsize() ).isOK() );
             }
 
             delete[] x;
         }
 
-        log() << "RandomData: didn't crash valid/total: " << numValid << "/" << numToRun << " (want few valid ones)" 
+        log() << "RandomData: didn't crash valid/total: " << numValid << "/" << numToRun
+              << " (want few valid ones)"
               << " jsonSize: " << jsonSize << endl;
     }
 
     TEST(BSONValidate, MuckingData1) {
 
         BSONObj theObject;
-        
+
         {
             BSONObjBuilder b;
             b.append( "name" , "eliot was here" );
@@ -80,32 +85,127 @@ namespace {
             }
             a.done();
             b.done();
-            
+
             theObject = b.obj();
         }
 
         int numValid = 0;
         int numToRun = 1000;
         long long jsonSize = 0;
-        
+
         for ( int i=4; i<theObject.objsize()-1; i++ ) {
             BSONObj mine = theObject.copy();
-            
+
             char* data = const_cast<char*>(mine.objdata());
-            
+
             data[ i ] = 200;
 
             numToRun++;
             if ( mine.valid() ) {
                 numValid++;
                 jsonSize += mine.jsonString().size();
+                ASSERT( validateBSON( mine.objdata(), mine.objsize() ).isOK() );
             }
-   
+            else {
+                ASSERT( !validateBSON( mine.objdata(), mine.objsize() ).isOK() );
+            }
+
         }
 
-
-        log() << "MuckingData1: didn't crash valid/total: " << numValid << "/" << numToRun << " (want few valid ones) " 
-              << " jsonSize: " << jsonSize << endl;        
+        log() << "MuckingData1: didn't crash valid/total: " << numValid << "/" << numToRun
+              << " (want few valid ones) "
+              << " jsonSize: " << jsonSize << endl;
     }
+
+    TEST( BSONValidate, Fuzz ) {
+        int64_t seed = time( 0 );
+        log() << "BSONValidate Fuzz random seed: " << seed << endl;
+        PseudoRandom randomSource( seed );
+
+        BSONObj original = BSON( "one" << 3 <<
+                                 "two" << 5 <<
+                                 "three" << BSONObj() <<
+                                 "four" << BSON( "five" << BSON( "six" << 11 ) ) <<
+                                 "seven" << BSON_ARRAY( "a" << "bb" << "ccc" << 5 ) <<
+                                 "eight" << BSONDBRef( "rrr", OID( "01234567890123456789aaaa" ) ) <<
+                                 "_id" << OID( "deadbeefdeadbeefdeadbeef" ) <<
+                                 "nine" << BSONBinData( "\x69\xb7", 2, BinDataGeneral ) <<
+                                 "ten" << Date_t( 44 ) <<
+                                 "eleven" << BSONRegEx( "foooooo", "i" ) );
+        
+        int32_t fuzzFrequencies[] = { 2, 10, 20, 100, 1000 };
+        for( size_t i = 0; i < sizeof( fuzzFrequencies ) / sizeof( int32_t ); ++i ) {
+            int32_t fuzzFrequency = fuzzFrequencies[ i ];
+
+            // Copy the 'original' BSONObj to 'buffer'.
+            scoped_array<char> buffer( new char[ original.objsize() ] );
+            memcpy( buffer.get(), original.objdata(), original.objsize() );
+
+            // Randomly flip bits in 'buffer', with probability determined by 'fuzzFrequency'. The
+            // first four bytes, representing the size of the object, are excluded from bit
+            // flipping.
+            for( int32_t byteIdx = 4; byteIdx < original.objsize(); ++byteIdx ) {
+                for( int32_t bitIdx = 0; bitIdx < 8; ++bitIdx ) {
+                    if ( randomSource.nextInt32( fuzzFrequency ) == 0 ) {
+                        reinterpret_cast<unsigned char&>( buffer[ byteIdx ] ) ^= ( 1U << bitIdx );
+                    }
+                }
+            }
+            BSONObj fuzzed( buffer.get() );
+
+            // Check that the two validation implementations agree (and neither crashes).
+            ASSERT_EQUALS( fuzzed.valid(),
+                           validateBSON( fuzzed.objdata(), fuzzed.objsize() ).isOK() );
+        }
+    }
+
+    TEST( BSONValidateFast, Empty ) {
+        BSONObj x;
+        ASSERT( validateBSON( x.objdata(), x.objsize() ).isOK() );
+    }
+
+    TEST( BSONValidateFast, RegEx ) {
+        BSONObjBuilder b;
+        b.appendRegex( "foo", "i" );
+        BSONObj x = b.obj();
+        ASSERT( validateBSON( x.objdata(), x.objsize() ).isOK() );
+    }
+
+    TEST(BSONValidateFast, Simple0 ) {
+        BSONObj x;
+        ASSERT( validateBSON( x.objdata(), x.objsize() ).isOK() );
+
+        x = BSON( "foo" << 17 << "bar" << "eliot" );
+        ASSERT( validateBSON( x.objdata(), x.objsize() ).isOK() );
+
+    }
+
+    TEST(BSONValidateFast, Simple2 ) {
+        char buf[64];
+        for ( int i=1; i<=JSTypeMax; i++ ) {
+            BSONObjBuilder b;
+            sprintf( buf, "foo%d", i );
+            b.appendMinForType( buf, i );
+            sprintf( buf, "bar%d", i );
+            b.appendMaxForType( buf, i );
+            BSONObj x = b.obj();
+            ASSERT( validateBSON( x.objdata(), x.objsize() ).isOK() );
+        }
+    }
+
+
+    TEST(BSONValidateFast, Simple3 ) {
+        BSONObjBuilder b;
+        char buf[64];
+        for ( int i=1; i<=JSTypeMax; i++ ) {
+            sprintf( buf, "foo%d", i );
+            b.appendMinForType( buf, i );
+            sprintf( buf, "bar%d", i );
+            b.appendMaxForType( buf, i );
+        }
+        BSONObj x = b.obj();
+        ASSERT( validateBSON( x.objdata(), x.objsize() ).isOK() );
+    }
+
 
 }

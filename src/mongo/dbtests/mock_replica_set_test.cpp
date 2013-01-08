@@ -24,9 +24,12 @@ using mongo::BSONElement;
 using mongo::BSONObj;
 using mongo::BSONObjIterator;
 using mongo::ConnectionString;
+using mongo::MockRemoteDBServer;
+using mongo::MockReplicaSet;
 
 using std::set;
 using std::string;
+using std::vector;
 
 namespace mongo_test {
     TEST(MockReplicaSetTest, SetName) {
@@ -238,6 +241,142 @@ namespace mongo_test {
         }
 
         ASSERT(expectedMembers == memberList);
+    }
+
+    TEST(MockReplicaSetTest, IsMasterReconfigNodeRemoved) {
+        MockReplicaSet replSet("n", 3);
+
+        MockReplicaSet::ReplConfigMap config = replSet.getReplConfig();
+        const string hostToRemove("$n1:27017");
+        config.erase(hostToRemove);
+        replSet.setConfig(config);
+
+        {
+            // Check isMaster for node still in set
+            BSONObj cmdResponse;
+            MockRemoteDBServer* node = replSet.getNode("$n0:27017");
+            const MockRemoteDBServer::InstanceID id = node->getInstanceID();
+            bool ok = node->runCommand(id, "foo.bar", BSON("ismaster" << 1), cmdResponse);
+            ASSERT(ok);
+
+            ASSERT(cmdResponse["ismaster"].trueValue());
+            ASSERT(!cmdResponse["secondary"].trueValue());
+            ASSERT_EQUALS("$n0:27017", cmdResponse["me"].str());
+            ASSERT_EQUALS("$n0:27017", cmdResponse["primary"].str());
+            ASSERT_EQUALS("n", cmdResponse["setName"].str());
+
+            set<string> expectedHosts;
+            expectedHosts.insert("$n0:27017");
+            expectedHosts.insert("$n2:27017");
+
+            set<string> hostList;
+            BSONObjIterator iter(cmdResponse["hosts"].embeddedObject());
+            while (iter.more()) {
+                hostList.insert(iter.next().str());
+            }
+
+            ASSERT(expectedHosts == hostList);
+            ASSERT(hostList.count(hostToRemove) == 0);
+        }
+
+        {
+            // Check isMaster for node still not in set anymore
+            BSONObj cmdResponse;
+            MockRemoteDBServer* node = replSet.getNode(hostToRemove);
+            const MockRemoteDBServer::InstanceID id = node->getInstanceID();
+            bool ok = node->runCommand(id, "foo.bar", BSON("ismaster" << 1), cmdResponse);
+            ASSERT(ok);
+
+            ASSERT(!cmdResponse["ismaster"].trueValue());
+            ASSERT(!cmdResponse["secondary"].trueValue());
+            ASSERT_EQUALS(hostToRemove, cmdResponse["me"].str());
+            ASSERT_EQUALS("n", cmdResponse["setName"].str());
+        }
+    }
+
+    TEST(MockReplicaSetTest, replSetGetStatusReconfigNodeRemoved) {
+        MockReplicaSet replSet("n", 3);
+
+        MockReplicaSet::ReplConfigMap config = replSet.getReplConfig();
+        const string hostToRemove("$n1:27017");
+        config.erase(hostToRemove);
+        replSet.setConfig(config);
+
+        {
+            // Check replSetGetStatus for node still in set
+            BSONObj cmdResponse;
+            MockRemoteDBServer* node = replSet.getNode("$n2:27017");
+            const MockRemoteDBServer::InstanceID id = node->getInstanceID();
+            bool ok = node->runCommand(id, "foo.bar", BSON("replSetGetStatus" << 1), cmdResponse);
+            ASSERT(ok);
+
+            ASSERT_EQUALS("n", cmdResponse["set"].str());
+            ASSERT_EQUALS(2, cmdResponse["myState"].numberInt());
+
+            set<string> memberList;
+            BSONObjIterator iter(cmdResponse["members"].embeddedObject());
+            while (iter.more()) {
+                BSONElement member(iter.next());
+                memberList.insert(member["name"].str());
+
+                if (member["self"].trueValue()) {
+                    ASSERT_EQUALS(2, member["state"].numberInt());
+                    ASSERT_EQUALS("$n2:27017", member["name"].str());
+                }
+                else if (member["name"].str() == "$n0:27017") {
+                    ASSERT_EQUALS(1, member["state"].numberInt());
+                }
+                else {
+                    ASSERT_EQUALS(2, member["state"].numberInt());
+                }
+            }
+
+            set<string> expectedMembers;
+            expectedMembers.insert("$n0:27017");
+            expectedMembers.insert("$n2:27017");
+            ASSERT(expectedMembers == memberList);
+        }
+
+        {
+            // Check replSetGetStatus for node still not in set anymore
+            BSONObj cmdResponse;
+            MockRemoteDBServer* node = replSet.getNode(hostToRemove);
+            const MockRemoteDBServer::InstanceID id = node->getInstanceID();
+            bool ok = node->runCommand(id, "foo.bar", BSON("replSetGetStatus" << 1), cmdResponse);
+            ASSERT(ok);
+
+            ASSERT_EQUALS("n", cmdResponse["set"].str());
+            ASSERT_EQUALS(10, cmdResponse["myState"].numberInt());
+        }
+    }
+
+    TEST(MockReplicaSetTest, KillNode) {
+        MockReplicaSet replSet("n", 3);
+        const string priHostName(replSet.getPrimary());
+        replSet.kill(priHostName);
+
+        ASSERT(!replSet.getNode(priHostName)->isRunning());
+
+        const vector<string> secondaries = replSet.getSecondaries();
+        for (vector<string>::const_iterator iter = secondaries.begin();
+                iter != secondaries.end(); ++iter) {
+            ASSERT(replSet.getNode(*iter)->isRunning());
+        }
+    }
+
+    TEST(MockReplicaSetTest, KillMultipleNode) {
+        MockReplicaSet replSet("n", 3);
+
+        const vector<string> secondaries = replSet.getSecondaries();
+        replSet.kill(replSet.getSecondaries());
+
+        for (vector<string>::const_iterator iter = secondaries.begin();
+                iter != secondaries.end(); ++iter) {
+            ASSERT(!replSet.getNode(*iter)->isRunning());
+        }
+
+        const string priHostName(replSet.getPrimary());
+        ASSERT(replSet.getNode(priHostName)->isRunning());
     }
 }
 

@@ -35,9 +35,11 @@
 #include "mongo/util/password.h"
 #include "mongo/util/stacktrace.h"
 #include "mongo/util/startup_test.h"
+#include "mongo/util/text.h"
 #include "mongo/util/version.h"
 
 #ifdef _WIN32
+#include <io.h>
 #define isatty _isatty
 #else
 #include <unistd.h>
@@ -488,6 +490,12 @@ static void edit( const string& whatToEdit ) {
 
     string js;
     if ( editingVariable ) {
+        // If "whatToEdit" is undeclared or uninitialized, declare 
+        int varType = shellMainScope->type( whatToEdit.c_str() );
+        if ( varType == Undefined ) {
+            shellMainScope->exec( "var " + whatToEdit , "(shell)", false, true, false );
+        }
+
         // Convert "whatToEdit" to JavaScript (JSON) text
         if ( !shellMainScope->exec( "__jsout__ = tojson(" + whatToEdit + ")", "tojs", false, false, false ) )
             return; // Error already printed
@@ -610,6 +618,11 @@ int _main( int argc, char* argv[], char **envp ) {
 
     string username;
     string password;
+    string authenticationMechanism;
+
+    std::string sslPEMKeyFile;
+    std::string sslPEMKeyPassword;
+    std::string sslCAFile;
 
     bool runShell = false;
     bool nodb = false;
@@ -632,12 +645,19 @@ int _main( int argc, char* argv[], char **envp ) {
     ( "eval", po::value<string>( &script ), "evaluate javascript" )
     ( "username,u", po::value<string>(&username), "username for authentication" )
     ( "password,p", new mongo::PasswordValue( &password ), "password for authentication" )
+    ("authenticationMechanism",
+     po::value<string>(&authenticationMechanism)->default_value("MONGO-CR"),
+     "authentication mechanism")
     ( "help,h", "show this usage information" )
     ( "version", "show version information" )
     ( "verbose", "increase verbosity" )
     ( "ipv6", "enable IPv6 support (disabled by default)" )
 #ifdef MONGO_SSL
     ( "ssl", "use SSL for all connections" )
+    ( "sslCAFile", po::value<std::string>(&sslCAFile), "Certificate Authority for SSL" )
+    ( "sslPEMKeyFile", po::value<std::string>(&sslPEMKeyFile), "PEM certificate/key file for SSL" )
+    ( "sslPEMKeyPassword", po::value<std::string>(&sslPEMKeyFile), 
+      "password for key in PEM file for SSL" )
 #endif
     ;
 
@@ -711,6 +731,15 @@ int _main( int argc, char* argv[], char **envp ) {
     if ( params.count( "ssl" ) ) {
         mongo::cmdLine.sslOnNormalPorts = true;
     }
+    if (params.count("sslPEMKeyFile")) {
+        mongo::cmdLine.sslPEMKeyFile = params["sslPEMKeyFile"].as<std::string>();
+    }
+    if (params.count("sslPEMKeyPassword")) {
+        mongo::cmdLine.sslPEMKeyPassword = params["sslPEMKeyPassword"].as<std::string>();
+    }
+    if (params.count("sslCAFile")) {
+        mongo::cmdLine.sslCAFile = params["sslCAFile"].as<std::string>();
+    }
 #endif
     if ( params.count( "nokillop" ) ) {
         mongo::shell_utils::_nokillop = true;
@@ -773,11 +802,32 @@ int _main( int argc, char* argv[], char **envp ) {
         if ( params.count( "password" ) && password.empty() )
             password = mongo::askPassword();
 
-        if ( username.size() && password.size() ) {
-            stringstream ss;
-            ss << "if ( ! db.auth( \"" << username << "\" , \"" << password << "\" ) ){ throw 'login failed'; }";
-            mongo::shell_utils::_dbAuth = ss.str();
+        // Construct the authentication-related code to execute on shell startup.
+        //
+        // This constructs and immediately executes an anonymous function, to avoid
+        // the shell's default behavior of printing statement results to the console.
+        //
+        // It constructs a statement of the following form:
+        //
+        // (function() {
+        //    // Set default authentication mechanism and, maybe, authenticate.
+        //  }())
+        stringstream authStringStream;
+        authStringStream << "(function() { " << endl;
+        if ( !authenticationMechanism.empty() ) {
+            authStringStream << "DB.prototype._defaultAuthenticationMechanism = \"" <<
+                authenticationMechanism << "\";" << endl;
         }
+
+        if ( username.size() ) {
+            authStringStream << "var username = \"" << username << "\";" << endl;
+            authStringStream << "var password = \"" << password << "\";" << endl;
+            authStringStream << "if (!db.auth(username, password)) { throw 'login failed'; }"
+                             << endl;
+        }
+        authStringStream << "}())";
+
+        mongo::shell_utils::_dbAuth = authStringStream.str();
     }
 
     mongo::ScriptEngine::setConnectCallback( mongo::shell_utils::onConnect );
@@ -825,7 +875,7 @@ int _main( int argc, char* argv[], char **envp ) {
 #endif
             if ( !rcLocation.empty() && fileExists(rcLocation) ) {
                 hasMongoRC = true;
-                if ( ! scope->execFile( rcLocation , false , true , false , 0 ) ) {
+                if ( ! scope->execFile( rcLocation , false , true ) ) {
                     cout << "The \".mongorc.js\" file located in your home folder could not be executed" << endl;
                     return -5;
                 }
@@ -840,6 +890,10 @@ int _main( int argc, char* argv[], char **envp ) {
            fstream f;
            f.open(rcLocation.c_str(), ios_base::out );
            f.close();
+        }
+
+        if ( !nodb ) {
+            scope->exec( "shellHelper( 'show', 'startupWarnings' )", "(shellwarnings", false, true, false );
         }
 
         shellHistoryInit();

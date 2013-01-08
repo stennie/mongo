@@ -17,21 +17,23 @@
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "pch.h"
-#include "../db/repl.h"
+#include "mongo/pch.h"
 
-#include "../db/db.h"
-#include "../db/instance.h"
-#include "../db/json.h"
+#include "mongo/db/repl.h"
 
-#include "dbtests.h"
-#include "../db/oplog.h"
-#include "../db/queryoptimizer.h"
+#include "mongo/db/db.h"
+#include "mongo/db/index_update.h"
+#include "mongo/db/instance.h"
+#include "mongo/db/json.h"
+#include "mongo/db/oplog.h"
+#include "mongo/db/queryoptimizer.h"
+#include "mongo/db/repl/rs.h"
 
-#include "../db/repl/rs.h"
+#include "mongo/dbtests/dbtests.h"
 
 namespace mongo {
     void createOplog();
+    void oldRepl();
 }
 
 namespace ReplTests {
@@ -45,9 +47,12 @@ namespace ReplTests {
         Client::Context _context;
     public:
         Base() : _context( ns() ) {
+            oldRepl();
+            cmdLine._replSet = "";
+            cmdLine.oplogSize = 5 * 1024 * 1024;
             replSettings.master = true;
             createOplog();
-            ensureHaveIdIndex( ns() );
+            ensureHaveIdIndex( ns(), false );
         }
         ~Base() {
             try {
@@ -156,7 +161,7 @@ namespace ReplTests {
         static void insert( const BSONObj &o, bool god = false ) {
             Lock::GlobalWrite lk;
             Client::Context ctx( ns() );
-            theDataFileMgr.insert( ns(), o.objdata(), o.objsize(), god );
+            theDataFileMgr.insert( ns(), o.objdata(), o.objsize(), false, god );
         }
         static BSONObj wid( const char *json ) {
             class BSONObjBuilder b;
@@ -832,6 +837,66 @@ namespace ReplTests {
             }
         };
 
+        class PushSlice : public Base {
+            void doIt() const {
+                client()->update( ns(),
+                                  BSON( "_id" << 0),
+                                  BSON( "$push" <<
+                                        BSON( "a" <<
+                                              BSON( "$each" << BSON_ARRAY(3) <<
+                                                    "$slice" << -2 ) ) ) );
+            }
+            using ReplTests::Base::check;
+            void check() const {
+                ASSERT_EQUALS( 1, count() );
+                check( fromjson( "{'_id':0, a:[2,3]}"), one( fromjson( "{'_id':0}" ) ) );
+            }
+            void reset() const {
+                deleteAll( ns() );
+                insert( BSON( "_id" << 0 << "a" << BSON_ARRAY( 1 << 2 ) ) );
+            }
+        };
+
+        class PushSliceInitiallyInexistent : public Base {
+            void doIt() const {
+                client()->update( ns(),
+                                  BSON( "_id" << 0),
+                                  BSON( "$push" <<
+                                        BSON( "a" <<
+                                              BSON( "$each" << BSON_ARRAY(1<<2) <<
+                                                    "$slice" << -2 ) ) ) );
+            }
+            using ReplTests::Base::check;
+            void check() const {
+                ASSERT_EQUALS( 1, count() );
+                check( fromjson( "{'_id':0, a:[1,2] }"), one( fromjson( "{'_id':0}" ) ) );
+            }
+            void reset() const {
+                deleteAll( ns() );
+                insert( BSON( "_id" << 0 ) );
+            }
+        };
+
+        class PushSliceToZero : public Base {
+            void doIt() const {
+                client()->update( ns(),
+                                  BSON( "_id" << 0),
+                                  BSON( "$push" <<
+                                        BSON( "a" <<
+                                              BSON( "$each" << BSON_ARRAY(3) <<
+                                                    "$slice" << 0 ) ) ) );
+            }
+            using ReplTests::Base::check;
+            void check() const {
+                ASSERT_EQUALS( 1, count() );
+                check( fromjson( "{'_id':0, a:[]}"), one( fromjson( "{'_id':0}" ) ) );
+            }
+            void reset() const {
+                deleteAll( ns() );
+                insert( BSON( "_id" << 0 ) );
+            }
+        };
+
         class PushAllUpsert : public Base {
         public:
             void doIt() const {
@@ -1139,6 +1204,23 @@ namespace ReplTests {
             void reset() const {
                 deleteAll( ns() );
                 insert( fromjson( "{'_id':0,a:{b:[]},z:1}" ) );
+            }
+        };
+
+        class ReplayArrayFieldNotAppended : public Base {
+        public:
+            void doIt() const {
+                client()->update( ns(), BSONObj(), fromjson( "{$push:{'a.0.b':2}}" ) );
+                client()->update( ns(), BSONObj(), fromjson( "{$set:{'a.0':1}}") );
+            }
+            using ReplTests::Base::check;
+            void check() const {
+                ASSERT_EQUALS( 1, count() );
+                check( fromjson( "{_id:0,a:[1,{b:[1]}]}" ), one(fromjson("{'_id':0}") ) );
+            }
+            void reset() const {
+                deleteAll( ns() );
+                insert( fromjson( "{'_id':0,a:[{b:[0]},{b:[1]}]}" ) );
             }
         };
 
@@ -1545,6 +1627,9 @@ namespace ReplTests {
             add< Idempotence::EmptyPushSparseIndex >();
             add< Idempotence::PushAll >();
             add< Idempotence::PushWithDollarSigns >();
+            add< Idempotence::PushSlice >();
+            add< Idempotence::PushSliceInitiallyInexistent >();
+            add< Idempotence::PushSliceToZero >();
             add< Idempotence::PushAllUpsert >();
             add< Idempotence::EmptyPushAll >();
             add< Idempotence::Pull >();
@@ -1563,6 +1648,7 @@ namespace ReplTests {
             add< Idempotence::AddToSetEmptyMissing >();
             add< Idempotence::AddToSetWithDollarSigns >();
             add< Idempotence::ReplaySetPreexistingNoOpPull >();
+            add< Idempotence::ReplayArrayFieldNotAppended >();
             add< DeleteOpIsIdBased >();
             add< DatabaseIgnorerBasic >();
             add< DatabaseIgnorerUpdate >();

@@ -81,13 +81,13 @@ namespace mongo {
 
         // ofs 352 (16 byte aligned)
         int _isCapped;                         // there is wasted space here if I'm right (ERH)
-        int _maxDocsInCapped;                  // max # of objects for a capped table.  TODO: should this be 64 bit?
+        int _maxDocsInCapped;                  // max # of objects for a capped table, -1 for inf.
 
         double _paddingFactor;                 // 1.0 = no padding.
         // ofs 386 (16)
         int _systemFlags; // things that the system sets/cares about
     public:
-        DiskLoc capExtent;
+        DiskLoc capExtent; // the "current" extent we're writing too for a capped collection
         DiskLoc capFirstNewRecord;
         unsigned short dataFileVersion;       // NamespaceDetails version.  So we can do backward compatibility in the future. See filever.h
         unsigned short indexFileVersion;
@@ -97,7 +97,7 @@ namespace mongo {
         unsigned long long reservedA;
         long long extraOffset;                // where the $extra info is located (bytes relative to this)
     public:
-        int indexBuildInProgress;             // 1 if in prog
+        int indexBuildsInProgress;            // Number of indexes currently being built
     private:
         int _userFlags;
         char reserved[72];
@@ -138,9 +138,6 @@ namespace mongo {
         Extra* allocExtra(const char *ns, int nindexessofar);
         void copyingFrom(const char *thisns, NamespaceDetails *src); // must be called when renaming a NS to fix up extra
 
-        /* called when loaded from disk */
-        void onLoad(const Namespace& k);
-
         /* dump info on this namespace.  for debugging. */
         void dump(const Namespace& k);
 
@@ -158,9 +155,13 @@ namespace mongo {
     public:
 
         bool isCapped() const { return _isCapped; }
-        long long maxCappedDocs() const { verify( isCapped() ); return _maxDocsInCapped; }
+        long long maxCappedDocs() const;
         void setMaxCappedDocs( long long max );
-
+        /**
+         * @param max in and out, will be adjusted
+         * @return if the value is valid at all
+         */
+        static bool validMaxCappedDocs( long long* max );
 
         DiskLoc& cappedListOfAllDeletedRecords() { return deletedList[0]; }
         DiskLoc& cappedLastDelRecLastExtent()    { return deletedList[1]; }
@@ -181,7 +182,7 @@ namespace mongo {
         /* when a background index build is in progress, we don't count the index in nIndexes until
            complete, yet need to still use it in _indexRecord() - thus we use this function for that.
         */
-        int nIndexesBeingBuilt() const { return nIndexes + indexBuildInProgress; }
+        int getTotalIndexCount() const { return nIndexes + indexBuildsInProgress; }
 
         /* NOTE: be careful with flags.  are we manipulating them in read locks?  if so,
                  this isn't thread safe.  TODO
@@ -195,12 +196,6 @@ namespace mongo {
         };
 
         IndexDetails& idx(int idxNo, bool missingExpected = false );
-
-        /** get the IndexDetails for the index currently being built in the background. (there is at most one) */
-        IndexDetails& inProgIdx() {
-            DEV verify(indexBuildInProgress);
-            return idx(nIndexes);
-        }
 
         class IndexIterator {
         public:
@@ -224,12 +219,19 @@ namespace mongo {
            for these, we have to do some dedup work on queries.
         */
         bool isMultikey(int i) const { return (multiKeyIndexBits & (((unsigned long long) 1) << i)) != 0; }
-        void setIndexIsMultikey(const char *thisns, int i);
+        void setIndexIsMultikey(const char *thisns, int i, bool multikey = true);
 
-        /* add a new index.  does not add to system.indexes etc. - just to NamespaceDetails.
-           caller must populate returned object.
+        /**
+         * This fetches the IndexDetails for the next empty index slot. The caller must populate
+         * returned object.  This handles allocating extra index space, if necessary.
          */
-        IndexDetails& addIndex(const char *thisns, bool resetTransient=true);
+        IndexDetails& getNextIndexDetails(const char* thisns);
+
+        /**
+         * Add a new index.  This does not add it to system.indexes etc. - just to NamespaceDetails.
+         * This resets the transient namespace details.
+         */
+        void addIndex(const char* thisns);
 
         void aboutToDeleteAnIndex() { 
             clearSystemFlag( Flag_HaveIdIndex );
@@ -306,6 +308,12 @@ namespace mongo {
         const IndexDetails* findIndexByPrefix( const BSONObj &keyPattern ,
                                                bool requireSingleKey );
 
+        /* Updates the expireAfterSeconds field of the given index to the value in newExpireSecs.
+         * The specified index must already contain an expireAfterSeconds field, and the value in
+         * that field and newExpireSecs must both be numeric.
+         */
+        void updateTTLIndex( int idxNo , const BSONElement& newExpireSecs );
+
 
         const int systemFlags() const { return _systemFlags; }
         bool isSystemFlagSet( int flag ) const { return _systemFlags & flag; }
@@ -356,13 +364,21 @@ namespace mongo {
             return Buckets-1;
         }
 
+        /* @return the size for an allocated record quantized to 1/16th of the BucketSize
+           @param allocSize    requested size to allocate
+        */
+        static int quantizeAllocationSpace(int allocSize);
+
         /* predetermine location of the next alloc without actually doing it. 
            if cannot predetermine returns null (so still call alloc() then)
         */
         DiskLoc allocWillBeAt(const char *ns, int lenToAlloc);
 
-        /* allocate a new record.  lenToAlloc includes headers. */
-        DiskLoc alloc(const char *ns, int lenToAlloc, DiskLoc& extentLoc);
+        /** allocate space for a new record from deleted lists.
+            @param lenToAlloc is WITH header
+            @return null diskloc if no room - allocate a new extent then
+        */
+        DiskLoc alloc(const char* ns, int lenToAlloc);
 
         /* add a given record to the deleted chains for this NS */
         void addDeletedRec(DeletedRecord *d, DiskLoc dloc);
@@ -475,9 +491,6 @@ namespace mongo {
          *
          * @param planPolicy - A policy for selecting query plans - see queryoptimizercursor.h
          *
-         * @param simpleEqualityMatch - Set to true for certain simple queries - see
-         * queryoptimizer.cpp.
-         *
          * @param parsedQuery - Additional query parameters, as from a client query request.
          *
          * @param requireOrder - If false, the resulting cursor may return results in an order
@@ -497,15 +510,15 @@ namespace mongo {
          * - covered indexes
          * - in memory sorting
          */
-        static shared_ptr<Cursor> getCursor( const char *ns, const BSONObj &query,
-                                            const BSONObj &order = BSONObj(),
-                                            const QueryPlanSelectionPolicy &planPolicy =
-                                            QueryPlanSelectionPolicy::any(),
-                                            bool *simpleEqualityMatch = 0,
-                                            const shared_ptr<const ParsedQuery> &parsedQuery =
-                                            shared_ptr<const ParsedQuery>(),
-                                            bool requireOrder = true,
-                                            QueryPlanSummary *singlePlanSummary = 0 );
+        static shared_ptr<Cursor> getCursor( const StringData& ns,
+                                             const BSONObj& query,
+                                             const BSONObj& order = BSONObj(),
+                                             const QueryPlanSelectionPolicy& planPolicy =
+                                                 QueryPlanSelectionPolicy::any(),
+                                             const shared_ptr<const ParsedQuery>& parsedQuery =
+                                                 shared_ptr<const ParsedQuery>(),
+                                             bool requireOrder = true,
+                                             QueryPlanSummary* singlePlanSummary = NULL );
 
         /**
          * @return a single cursor that may work well for the given query.  A $or style query will
@@ -623,7 +636,7 @@ namespace mongo {
         void add_ns(const char *ns, DiskLoc& loc, bool capped);
         void add_ns( const char *ns, const NamespaceDetails &details );
 
-        NamespaceDetails* details(const char *ns) {
+        NamespaceDetails* details(const StringData& ns) {
             if ( !ht )
                 return 0;
             Namespace n(ns);

@@ -18,14 +18,11 @@
 
 #include "pch.h"
 #include "db/json.h"
-
 #include "tool.h"
 #include "../util/text.h"
 #include "mongo/base/initializer.h"
-
 #include <fstream>
 #include <iostream>
-
 #include <boost/program_options.hpp>
 #include <boost/algorithm/string.hpp>
 #include <boost/filesystem/operations.hpp>
@@ -127,7 +124,7 @@ class Import : public Tool {
 
             uassert(16329, str::stream() << "read error, or input line too long (max length: "
                     << BUF_SIZE << ")", !(in->rdstate() & ios_base::failbit));
-            log(1) << "got line:" << buf << endl;
+            LOG(1) << "got line:" << buf << endl;
         }
         uassert( 10263 ,  "unknown error reading file" ,
                  (!(in->rdstate() & ios_base::badbit)) &&
@@ -274,7 +271,7 @@ public:
         ("type",po::value<string>() , "type of file to import.  default: json (json,csv,tsv)")
         ("file",po::value<string>() , "file to import from; if not specified stdin is used" )
         ("drop", "drop collection first " )
-        ("headerline","CSV,TSV only - use first line as headers")
+        ("headerline","first line in input file is a header (CSV and TSV only)")
         ("upsert", "insert or update objects that already exist" )
         ("upsertFields", po::value<string>(), "comma-separated fields for the query part of the upsert. You should make sure this is indexed" )
         ("stopOnError", "stop importing at first error rather than continuing" )
@@ -294,6 +291,9 @@ public:
     ;
     virtual void printExtraHelp( ostream & out ) {
         out << "Import CSV, TSV or JSON data into MongoDB.\n" << endl;
+        out << "When importing JSON documents, each document must be a separate line of the input file.\n";
+        out << "\nExample:\n";
+        out << "  mongoimport --host myhost --db my_cms --collection docs < mydocfile.json\n" << endl;
     }
 
     unsigned long long lastErrorFailures;
@@ -349,7 +349,7 @@ public:
             return -1;
         }
 
-        log(1) << "ns: " << ns << endl;
+        LOG(1) << "ns: " << ns << endl;
 
         auth();
 
@@ -411,7 +411,7 @@ public:
         }
 
         time_t start = time(0);
-        log(1) << "filesize: " << fileSize << endl;
+        LOG(1) << "filesize: " << fileSize << endl;
         ProgressMeter pm( fileSize );
         int num = 0;
         int lastNumChecked = num;
@@ -519,4 +519,5 @@ int main( int argc , char ** argv, char** envp ) {
     Import import;
     return import.main( argc , argv );
 }
+
 const int Import::BUF_SIZE(1024 * 1024 * 16);

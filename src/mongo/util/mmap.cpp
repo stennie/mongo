@@ -118,7 +118,7 @@ namespace {
 
         LockMongoFilesExclusive lk;
 
-        ProgressMeter pm( mmfiles.size() , 2 , 1 );
+        ProgressMeter pm(mmfiles.size(), 2, 1, "File Closing Progress");
         set<MongoFile*> temp = mmfiles;
         for ( set<MongoFile*>::iterator i = temp.begin(); i != temp.end(); i++ ) {
             (*i)->close(); // close() now removes from mmfiles
@@ -208,6 +208,21 @@ namespace {
         return mapFindWithDefault(pathToFile,
                                   boost::filesystem::absolute(path).generic_string(),
                                   static_cast<MongoFile*>(NULL));
+    }
+
+
+    void printMemInfo( const char * where ) {
+        cout << "mem info: ";
+        if ( where )
+            cout << where << " ";
+
+        ProcessInfo pi;
+        if ( ! pi.supported() ) {
+            cout << " not supported" << endl;
+            return;
+        }
+
+        cout << "vsize: " << pi.getVirtualMemorySize() << " resident: " << pi.getResidentSize() << " mapped: " << ( MemoryMappedFile::totalMappedLength() / ( 1024 * 1024 ) ) << endl;
     }
 
 } // namespace mongo

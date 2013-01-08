@@ -23,8 +23,8 @@
 #include "mongo/pch.h"
 
 #include "mongo/client/authlevel.h"
-#include "mongo/client/authentication_table.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/util/net/message.h"
 #include "mongo/util/net/message_port.h"
 
@@ -165,7 +165,13 @@ namespace mongo {
         ReadPreference_Nearest,
     };
 
+    /**
+     * @return true if the query object contains a read preference specification object.
+     */
+    bool hasReadPreference(const BSONObj& queryObj);
+
     class DBClientBase;
+    class DBClientConnection;
 
     /**
      * ConnectionString handles parsing different ways to connect to mongo and determining method
@@ -174,6 +180,9 @@ namespace mongo {
      *    server:port
      *    foo/server:port,server:port   SET
      *    server,server,server          SYNC
+     *                                    Warning - you usually don't want "SYNC", it's used 
+     *                                    for some special things such as sharding config servers.
+     *                                    See syncclusterconnection.h for more info.
      *
      * tyipcal use
      * string errmsg,
@@ -247,6 +256,14 @@ namespace mongo {
         
         ConnectionType type() const { return _type; }
 
+        /**
+         * This returns true if this and other point to the same logical entity.
+         * For single nodes, thats the same address.
+         * For replica sets, thats just the same replica set name.
+         * For pair (deprecated) or sync cluster connections, that's the same hosts in any ordering.
+         */
+        bool sameLogicalEndpoint( const ConnectionString& other ) const;
+
         static ConnectionString parse( const string& url , string& errmsg );
 
         static string typeToString( ConnectionType type );
@@ -270,6 +287,11 @@ namespace mongo {
         static void setConnectionHook( ConnectionHook* hook ){
             scoped_lock lk( _connectHookMutex );
             _connectHook = hook;
+        }
+
+        static ConnectionHook* getConnectionHook() {
+            scoped_lock lk( _connectHookMutex );
+            return _connectHook;
         }
 
     private:
@@ -546,8 +568,7 @@ namespace mongo {
 
         DBClientWithCommands() : _logLevel(0),
                 _cachedAvailableOptions( (enum QueryOptions)0 ),
-                _haveCachedAvailableOptions(false),
-                _hasAuthentication(false) { }
+                _haveCachedAvailableOptions(false) { }
 
         /** helper function.  run a simple command where the command expression is simply
               { command : 1 }
@@ -559,9 +580,7 @@ namespace mongo {
 
         /** Run a database command.  Database commands are represented as BSON objects.  Common database
             commands have prebuilt helper functions -- see below.  If a helper is not available you can
-            directly call runCommand.  If _authTable has been set, will append a BSON representation of
-            that AuthenticationTable to the command object, unless an AuthenticationTable object has been
-            passed to this method directly, in which case it will use that instead of _authTable.
+            directly call runCommand.
 
             @param dbname database name.  Use "admin" for global administrative commands.
             @param cmd  the command object to execute.  For example, { ismaster : 1 }
@@ -573,7 +592,7 @@ namespace mongo {
             @return true if the command returned "ok".
         */
         virtual bool runCommand(const string &dbname, const BSONObj& cmd, BSONObj &info,
-                                int options=0, const AuthenticationTable* auth = NULL);
+                                int options=0);
 
         /** Authorize access to a particular database.
             Authentication is separate for each database on the server -- you may authenticate for any
@@ -842,9 +861,6 @@ namespace mongo {
 
         bool exists( const string& ns );
 
-        virtual void setAuthenticationTable( const AuthenticationTable& auth );
-        virtual void clearAuthenticationTable();
-
         /** Create an index if it does not already exist.
             ensureIndex calls are remembered so it is safe/fast to call this function many
             times in your code.
@@ -912,14 +928,9 @@ namespace mongo {
 
         virtual QueryOptions _lookupAvailableOptions();
 
-        bool hasAuthenticationTable();
-        AuthenticationTable& getAuthenticationTable();
-
     private:
         enum QueryOptions _cachedAvailableOptions;
         bool _haveCachedAvailableOptions;
-        AuthenticationTable _authTable;
-        bool _hasAuthentication;
     };
 
     /**
@@ -927,12 +938,18 @@ namespace mongo {
      */
     class DBClientBase : public DBClientWithCommands, public DBConnector {
     protected:
+        static AtomicInt64 ConnectionIdSequence;
+        long long _connectionId; // unique connection id for this connection
         WriteConcern _writeConcern;
-
     public:
+        static const uint64_t INVALID_SOCK_CREATION_TIME;
+
         DBClientBase() {
             _writeConcern = W_NORMAL;
+            _connectionId = ConnectionIdSequence.fetchAndAdd(1);
         }
+
+        long long getConnectionId() const { return _connectionId; }
 
         WriteConcern getWriteConcern() const { return _writeConcern; }
         void setWriteConcern( WriteConcern w ) { _writeConcern = w; }
@@ -1021,6 +1038,10 @@ namespace mongo {
         virtual ConnectionString::ConnectionType type() const = 0;
         
         virtual double getSoTimeout() const = 0;
+
+        virtual uint64_t getSockCreationMicroSec() const {
+            return INVALID_SOCK_CREATION_TIME;
+        }
 
     }; // DBClientBase
 
@@ -1113,8 +1134,7 @@ namespace mongo {
         virtual bool runCommand(const string &dbname,
                                 const BSONObj& cmd,
                                 BSONObj &info,
-                                int options=0,
-                                const AuthenticationTable* auth=NULL);
+                                int options=0);
 
         /**
            @return true if this connection is currently in a failed state.  When autoreconnect is on,
@@ -1152,8 +1172,22 @@ namespace mongo {
             return _numConnections;
         }
 
+        /**
+         * Primarily used for notifying the replica set client that the server
+         * it is talking to is not primary anymore.
+         *
+         * @param rsClient caller is responsible for managing the life of rsClient
+         * and making sure that it lives longer than this object.
+         *
+         * Warning: This is only for internal use and will eventually be removed in
+         * the future.
+         */
+        void setReplSetClientCallback(DBClientReplicaSet* rsClient);
+
         static void setLazyKillCursor( bool lazy ) { _lazyKillCursor = lazy; }
         static bool getLazyKillCursor() { return _lazyKillCursor; }
+
+        uint64_t getSockCreationMicroSec() const;
 
     protected:
         friend class SyncClusterConnection;
@@ -1180,8 +1214,7 @@ namespace mongo {
         static bool _lazyKillCursor; // lazy means we piggy back kill cursors on next op
 
 #ifdef MONGO_SSL
-        static SSLManager* sslManager();
-        static SSLManager* _sslManager;
+        SSLManager* sslManager();
 #endif
     };
 

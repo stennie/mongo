@@ -66,6 +66,14 @@ namespace mongo {
             if ( name.find( "Tests" ) != string::npos )
                 return false;
             
+            if ( name.find( "ScopedDistributedLock" ) != string::npos )
+                return false;
+
+            if ( name.find( "PooledScope" ) != string::npos ) {
+                // SERVER-8090
+                return false;
+            }
+
             return method == clazz;
         }
         
