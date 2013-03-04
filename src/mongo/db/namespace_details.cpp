@@ -847,7 +847,7 @@ namespace mongo {
             return minRecordSize;
 
         if ( _paddingFactor == 0 ) {
-            warning() << "implicit updgrade of paddingFactor of very old collection" << endl;
+            warning() << "implicit upgrade of paddingFactor of very old collection" << endl;
             setPaddingFactor(1.0);
         }
         verify( _paddingFactor >= 1 );
