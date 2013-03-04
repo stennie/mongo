@@ -1007,8 +1007,6 @@ doneCheckOrder:
                 int j = i.pos();
                 IndexDetails& ii = i.next();
                 const IndexSpec& spec = ii.getSpec();
-                // TODO(hk): Make sure we can do a $near and $within query, one using
-                // the index one using the matcher.
                 if (special.has(spec.getTypeName()) &&
                     spec.suitability( _qps.frsp().frsForIndex(d, j), _qps.order() ) != USELESS ) {
                     uassert( 16330, "'special' query operator not allowed", _allowSpecial );
@@ -1016,10 +1014,13 @@ doneCheckOrder:
                     return true;
                 }
             }
-            if (special.anyRequireIndex()) {
+            // If all possible special indices require an index and we don't have one,
+            // error.
+            if (special.allRequireIndex()) {
                 uassert(13038, "can't find any special indices: " + special.toString()
                                + " for: " + _qps.originalQuery().toString(), false );
             }
+            // Otherwise, we can get the same functionality from the matcher.
         }
         return false;
     }

@@ -158,22 +158,21 @@ namespace mongo {
         // find the member with the lowest ping time that has more data than me
 
         // Find primary's oplog time. Reject sync candidates that are more than
-        // MAX_SLACK_TIME seconds behind.
+        // maxSyncSourceLagSecs seconds behind.
         OpTime primaryOpTime;
-        static const unsigned maxSlackDurationSeconds = 10 * 60; // 10 minutes
         if (primary)
             primaryOpTime = primary->hbinfo().opTime;
         else
             // choose a time that will exclude no candidates, since we don't see a primary
-            primaryOpTime = OpTime(maxSlackDurationSeconds, 0);
+            primaryOpTime = OpTime(maxSyncSourceLagSecs, 0);
 
-        if ( primaryOpTime.getSecs() < maxSlackDurationSeconds ) {
+        if (primaryOpTime.getSecs() < static_cast<unsigned int>(maxSyncSourceLagSecs)) {
             // erh - I think this means there was just a new election
             // and we don't yet know the new primary's optime
-            primaryOpTime = OpTime(maxSlackDurationSeconds, 0);
+            primaryOpTime = OpTime(maxSyncSourceLagSecs, 0);
         }
 
-        OpTime oldestSyncOpTime(primaryOpTime.getSecs() - maxSlackDurationSeconds, 0);
+        OpTime oldestSyncOpTime(primaryOpTime.getSecs() - maxSyncSourceLagSecs, 0);
 
         Member *closest = 0;
         time_t now = 0;
@@ -323,6 +322,8 @@ namespace mongo {
     /**
      * Do the initial sync for this member.  There are several steps to this process:
      *
+     *     0. Add _initialSyncFlag to minValid to tell us to restart initial sync if we
+     *        crash in the middle of this procedure
      *     1. Record start time.
      *     2. Clone.
      *     3. Set minValid1 to sync target's latest op time.
@@ -332,6 +333,7 @@ namespace mongo {
      *     7. Build indexes.
      *     8. Set minValid3 to sync target's latest op time.
      *     9. Apply ops from minValid2 to minValid3.
+          10. Clean up minValid and remove _initialSyncFlag field
      *
      * At that point, initial sync is finished.  Note that the oplog from the sync target is applied
      * three times: step 4, 6, and 8.  4 may involve refetching, 6 should not.  By the end of 6,
@@ -383,6 +385,9 @@ namespace mongo {
             return;
         }
         else {
+            // Add field to minvalid document to tell us to restart initial sync if we crash
+            theReplSet->setInitialSyncFlag();
+
             sethbmsg("initial sync drop all databases", 0);
             dropAllDatabasesExceptLocal();
 
@@ -432,7 +437,6 @@ namespace mongo {
         
         // ---------
 
-
         sethbmsg("initial sync finishing up",0);
 
         verify( !box.getState().primary() ); // wouldn't make sense if we were.
@@ -445,10 +449,19 @@ namespace mongo {
             }
             catch(...) { }
 
+            // Initial sync is now complete.  Flag this by setting minValid to the last thing
+            // we synced.
             theReplSet->setMinValid(minValid);
+
+            // Clear the initial sync flag.
+            theReplSet->clearInitialSyncFlag();
 
             cx.ctx().db()->flushFiles(true);
         }
+
+        // If we just cloned & there were no ops applied, we still want the primary to know where
+        // we're up to
+        replset::BackgroundSync::notify();
 
         changeState(MemberState::RS_RECOVERING);
         sethbmsg("initial sync done",0);

@@ -85,7 +85,7 @@ printjson(config.chunks.find().toArray());
 
 jsTest.log("Starting v2.4 mongos in 2.2 cluster....")
 
-var mongos = MongoRunner.runMongos({ binVersion : "latest", configdb : configConnStr, upgrade : "" })
+var mongos = MongoRunner.runMongos({ binVersion : "2.4", configdb : configConnStr, upgrade : "" })
 assert.neq(null, mongos);
 MongoRunner.stopMongos(mongos);
 
@@ -147,7 +147,7 @@ var checkUpgraded = function() {
     assert.eq(version.minCompatibleVersion, 3);
     assert.eq(version.currentVersion, 4);
     assert(version.clusterId);
-    assert.eq(version.excluding.length, 0);
+    assert.eq(version.excluding, undefined);
 }
 
 checkUpgraded();

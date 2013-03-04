@@ -2,23 +2,24 @@
 
 /*    Copyright 2009 10gen Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 //#include <third_party/js-1.7/jsapi.h>
 
 #include "mongo/base/init.h"
 #include "mongo/client/dbclientcursor.h"
+#include "mongo/client/sasl_client_authenticate.h"
 #include "mongo/db/namespacestring.h"
 #include "mongo/scripting/engine_spidermonkey.h"
 #include "mongo/scripting/engine_spidermonkey_internal.h"
@@ -32,6 +33,12 @@
 namespace mongo {
 
     bool haveLocalShardingInfo( const string& ns );
+
+    // Generated symbols for JS files
+    namespace JSFiles {
+        extern const JSFile types;
+        extern const JSFile assert;
+    }
 
 namespace spidermonkey {
 
@@ -329,21 +336,26 @@ namespace spidermonkey {
 
     JSBool mongo_auth(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval) {
         try {
-            smuassert( cx , "mongo_auth needs 3 args" , argc == 3 );
             DBClientWithCommands *conn = getConnection(cx, obj);
             smuassert(cx , "no connection!", conn);
 
-            Convertor c( cx );
-
-            string db = c.toString( argv[0] );
-            string username = c.toString( argv[1] );
-            string password = c.toString( argv[2] );
-            string errmsg = "";
-
-            if ( ! conn->auth( db, username, password, errmsg ) ) {
-                JS_ReportError( cx, errmsg.c_str() );
+            Convertor c(cx);
+            BSONObj params;
+            switch (argc) {
+            case 1:
+                params = c.toObject(argv[0]);
+                break;
+            case 3:
+                params = BSON(saslCommandMechanismFieldName << "MONGODB-CR" <<
+                              saslCommandPrincipalSourceFieldName << c.toString(argv[0]) <<
+                              saslCommandPrincipalFieldName << c.toString(argv[1]) <<
+                              saslCommandPasswordFieldName << c.toString(argv[2]));
+                break;
+            default:
+                JS_ReportError(cx, "mongo_auth takes 1 object or 3 string arguments");
                 return JS_FALSE;
             }
+            conn->auth(params);
         }
         catch ( const AssertionException& e ) {
             if ( ! JS_IsExceptionPending( cx ) ) {
@@ -1282,6 +1294,13 @@ zzz
                 c.setProperty( obj, "i", c.toval( 0.0 ) );
             }
             else {
+                long long t = parseLL(c.toString(argv[0]).c_str());
+                long long largestVal = ((2039LL-1970LL) *365*24*60*60); //seconds between 1970=2038
+                smuassert(  cx,
+                            ((string)(str::stream()
+                                << "The first argument must be in seconds;"
+                                << t << " is too large (max " << largestVal << ")")).c_str(),
+                            t <= largestVal );
                 c.setProperty( obj, "t", argv[ 0 ] );
                 c.setProperty( obj, "i", argv[ 1 ] );
             }
@@ -1650,6 +1669,9 @@ zzz
         dbref_class.name = dbrefName;
         verify( JS_InitClass( cx , global , 0 , &dbref_class , dbref_constructor , 2 , 0 , bson_functions , 0 , 0 ) );
 
+        scope->execSetup(JSFiles::assert);
+        scope->execSetup(JSFiles::types);
+
         scope->execCoreFiles();
     }
 
@@ -1673,7 +1695,7 @@ zzz
         }
 
         if ( JS_InstanceOf( c->_context , o , &timestamp_class , 0 ) ) {
-            b.appendTimestamp( name , (unsigned long long)c->getNumber( o , "t" ) , (unsigned int )c->getNumber( o , "i" ) );
+            b.appendTimestamp( name , (unsigned long long)c->getNumber( o , "t" ) * 1000 , (unsigned int )c->getNumber( o , "i" ) );
             return true;
         }
 

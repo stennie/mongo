@@ -57,6 +57,7 @@
 #include "mongo/db/stats/counters.h"
 #include "mongo/s/d_logic.h"
 #include "mongo/s/stale_exception.h" // for SendStaleConfigException
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/file_allocator.h"
 #include "mongo/util/goodies.h"
 #include "mongo/util/mongoutils/str.h"
@@ -86,6 +87,8 @@ namespace mongo {
 #ifdef _WIN32
     HANDLE lockFileHandle;
 #endif
+
+    MONGO_FP_DECLARE(rsStopGetMore);
 
     /*static*/ OpTime OpTime::_now() {
         OpTime result;
@@ -271,12 +274,10 @@ namespace mongo {
         if( ex ){
 
             op.debug().exceptionInfo = ex->getInfo();
-            LOGWITHRATELIMIT {
-                log() << "assertion " << ex->toString() << " ns:" << q.ns << " query:" <<
+            log() << "assertion " << ex->toString() << " ns:" << q.ns << " query:" <<
                 (q.query.valid() ? q.query.toString() : "query object is corrupt") << endl;
-                if( q.ntoskip || q.ntoreturn )
-                    log() << " ntoskip:" << q.ntoskip << " ntoreturn:" << q.ntoreturn << endl;
-            }
+            if( q.ntoskip || q.ntoreturn )
+                log() << " ntoskip:" << q.ntoskip << " ntoreturn:" << q.ntoreturn << endl;
 
             SendStaleConfigException* scex = NULL;
             if ( ex->getCode() == SendStaleConfigCode ) scex = static_cast<SendStaleConfigException*>( ex.get() );
@@ -292,10 +293,6 @@ namespace mongo {
 
             if( scex ){
                 log() << "stale version detected during query over "
-                      << q.ns << " : " << errObj << endl;
-            }
-            else{
-                log() << "problem detected during query over "
                       << q.ns << " : " << errObj << endl;
             }
 
@@ -667,6 +664,7 @@ namespace mongo {
         QueryResult* msgdata = 0;
         OpTime last;
         while( 1 ) {
+            bool isCursorAuthorized = false;
             try {
                 const NamespaceString nsString( ns );
                 uassert( 16258, str::stream() << "Invalid ns [" << ns << "]", nsString.isValid() );
@@ -675,6 +673,10 @@ namespace mongo {
                 uassert(16543, status.reason(), status.isOK());
 
                 if (str::startsWith(ns, "local.oplog.")){
+                    while (MONGO_FAIL_POINT(rsStopGetMore)) {
+                        sleepmillis(0);
+                    }
+
                     if (pass == 0) {
                         mutex::scoped_lock lk(OpTime::m);
                         last = OpTime::getLast(lk);
@@ -684,9 +686,23 @@ namespace mongo {
                     }
                 }
 
-                msgdata = processGetMore(ns, ntoreturn, cursorid, curop, pass, exhaust);
+                msgdata = processGetMore(ns,
+                                         ntoreturn,
+                                         cursorid,
+                                         curop,
+                                         pass,
+                                         exhaust,
+                                         &isCursorAuthorized);
             }
             catch ( AssertionException& e ) {
+                if ( isCursorAuthorized ) {
+                    // If a cursor with id 'cursorid' was authorized, it may have been advanced
+                    // before an exception terminated processGetMore.  Erase the ClientCursor
+                    // because it may now be out of sync with the client's iteration state.
+                    // SERVER-7952
+                    // TODO Temporary code, see SERVER-4563 for a cleanup overview.
+                    ClientCursor::erase( cursorid );
+                }
                 ex.reset( new AssertionException( e.getInfo().msg, e.getCode() ) );
                 ok = false;
                 break;
@@ -804,8 +820,10 @@ namespace mongo {
         const char *ns = d.getns();
         op.debug().ns = ns;
 
-        // Auth checking for index writes happens later.
-        if (NamespaceString(ns).coll != "system.indexes") {
+        bool isIndexWrite = NamespaceString(ns).coll == "system.indexes";
+
+        // Auth checking for index writes happens further down in this function.
+        if (!isIndexWrite) {
             Status status = cc().getAuthorizationManager()->checkAuthForInsert(ns);
             uassert(16544, status.reason(), status.isOK());
         }
@@ -814,13 +832,19 @@ namespace mongo {
             // strange.  should we complain?
             return;
         }
-        BSONObj first = d.nextJsObj();
 
         vector<BSONObj> multi;
         while (d.moreJSObjs()){
-            if (multi.empty()) // first pass
-                multi.push_back(first);
-            multi.push_back( d.nextJsObj() );
+            BSONObj obj = d.nextJsObj();
+            multi.push_back(obj);
+            if (isIndexWrite) {
+                string indexNS = obj.getStringField("ns");
+                uassert(16548,
+                        mongoutils::str::stream() << "not authorized to create index on "
+                                << indexNS,
+                        cc().getAuthorizationManager()->checkAuthorization(
+                                indexNS, ActionType::ensureIndex));
+            }
         }
 
         PageFaultRetryableSection s;
@@ -837,15 +861,14 @@ namespace mongo {
                 
                 Client::Context ctx(ns);
                 
-                if( !multi.empty() ) {
+                if (multi.size() > 1) {
                     const bool keepGoing = d.reservedField() & InsertOption_ContinueOnError;
                     insertMulti(keepGoing, ns, multi, op);
-                    return;
+                } else {
+                    checkAndInsert(ns, multi[0]);
+                    globalOpCounters.incInsertInWriteLock(1);
+                    op.debug().ninserted = 1;
                 }
-                
-                checkAndInsert(ns, first);
-                globalOpCounters.incInsertInWriteLock(1);
-                op.debug().ninserted = 1;
                 return;
             }
             catch ( PageFaultException& e ) {

@@ -32,214 +32,254 @@ namespace mongo {
                            << ", found " << doc[field.name()].toString();
     }
 
-    bool FieldParser::extract(BSONObj doc,
+    FieldParser::FieldState FieldParser::extract(BSONObj doc,
                               const BSONField<bool>& field,
-                              bool def,
                               bool* out,
                               string* errMsg)
     {
         BSONElement elem = doc[field.name()];
         if (elem.eoo()) {
-            *out = def;
-            return true;
+            if (field.hasDefault()) {
+                *out = field.getDefault();
+                return FIELD_DEFAULT;
+            }
+            else {
+                return FIELD_NONE;
+            }
         }
 
         if (elem.type() == Bool) {
             *out = elem.boolean();
-            return true;
+            return FIELD_SET;
         }
 
         _genFieldErrMsg(doc, field, "boolean", errMsg);
-        return false;
+        return FIELD_INVALID;
     }
 
-    bool FieldParser::extract(BSONObj doc,
+    FieldParser::FieldState FieldParser::extract(BSONObj doc,
                               const BSONField<BSONArray>& field,
-                              const BSONArray& def,
                               BSONArray* out,
                               string* errMsg)
     {
         BSONElement elem = doc[field.name()];
         if (elem.eoo()) {
-            *out = def;
-            return true;
+            if (field.hasDefault()) {
+                *out = field.getDefault();
+                return FIELD_DEFAULT;
+            }
+            else {
+                return FIELD_NONE;
+            }
         }
 
         if (elem.type() == Array) {
             *out = BSONArray(elem.embeddedObject().getOwned());
-            return true;
+            return FIELD_SET;
         }
 
         _genFieldErrMsg(doc, field, "array", errMsg);
-        return false;
+        return FIELD_INVALID;
     }
 
-    bool FieldParser::extract(BSONObj doc,
+    FieldParser::FieldState FieldParser::extract(BSONObj doc,
                               const BSONField<BSONObj>& field,
-                              const BSONObj& def,
                               BSONObj* out,
                               string* errMsg)
     {
         BSONElement elem = doc[field.name()];
         if (elem.eoo()) {
-            *out = def;
-            return true;
+            if (field.hasDefault()) {
+                *out = field.getDefault();
+                return FIELD_DEFAULT;
+            }
+            else {
+                return FIELD_NONE;
+            }
         }
 
         if (elem.type() == Object) {
             *out = elem.embeddedObject().getOwned();
-            return true;
+            return FIELD_SET;
         }
 
         _genFieldErrMsg(doc, field, "object", errMsg);
-        return false;
+        return FIELD_INVALID;
     }
 
-    bool FieldParser::extract(BSONObj doc,
+    FieldParser::FieldState FieldParser::extract(BSONObj doc,
                               const BSONField<Date_t>& field,
-                              const Date_t def,
                               Date_t* out,
                               string* errMsg)
     {
         BSONElement elem = doc[field.name()];
         if (elem.eoo()) {
-            *out = def;
-            return true;
+            if (field.hasDefault()) {
+                *out = field.getDefault();
+                return FIELD_DEFAULT;
+            }
+            else {
+                return FIELD_NONE;
+            }
         }
 
         if (elem.type() == Date) {
             *out = elem.date();
-            return true;
+            return FIELD_SET;
         }
 
         _genFieldErrMsg(doc, field, "date or timestamp", errMsg);
-        return false;
+        return FIELD_INVALID;
     }
 
-    bool FieldParser::extract(BSONObj doc,
+    FieldParser::FieldState FieldParser::extract(BSONObj doc,
                               const BSONField<string>& field,
-                              const string& def,
                               string* out,
                               string* errMsg)
     {
         BSONElement elem = doc[field.name()];
         if (elem.eoo()) {
-            *out = def;
-            return true;
+            if (field.hasDefault()) {
+                *out = field.getDefault();
+                return FIELD_DEFAULT;
+            }
+            else {
+                return FIELD_NONE;
+            }
         }
 
         if (elem.type() == String) {
             *out = elem.valuestr();
-            return true;
+            return FIELD_SET;
         }
 
         _genFieldErrMsg(doc, field, "string", errMsg);
-        return false;
+        return FIELD_INVALID;
     }
 
-    bool FieldParser::extract(BSONObj doc,
+    FieldParser::FieldState FieldParser::extract(BSONObj doc,
                               const BSONField<OID>& field,
-                              const OID& def,
                               OID* out,
                               string* errMsg)
     {
         BSONElement elem = doc[field.name()];
         if (elem.eoo()) {
-            *out = def;
-            return true;
+            if (field.hasDefault()) {
+                *out = field.getDefault();
+                return FIELD_DEFAULT;
+            }
+            else {
+                return FIELD_NONE;
+            }
         }
 
         if (elem.type() == jstOID) {
             *out = elem.__oid();
-            return true;
+            return FIELD_SET;
         }
 
         _genFieldErrMsg(doc, field, "OID", errMsg);
-        return false;
+        return FIELD_INVALID;
     }
 
-    bool FieldParser::extract(BSONObj doc,
+    FieldParser::FieldState FieldParser::extract(BSONObj doc,
                               const BSONField<int>& field,
-                              const int& def,
                               int* out,
                               string* errMsg)
     {
         BSONElement elem = doc[field.name()];
         if (elem.eoo()) {
-            *out = def;
-            return true;
+            if (field.hasDefault()) {
+                *out = field.getDefault();
+                return FIELD_DEFAULT;
+            }
+            else {
+                return FIELD_NONE;
+            }
         }
 
         if (elem.type() == NumberInt) {
             *out = elem.numberInt();
-            return true;
+            return FIELD_SET;
         }
 
         _genFieldErrMsg(doc, field, "integer", errMsg);
-        return false;
+        return FIELD_INVALID;
     }
 
-    bool FieldParser::extractNumber(BSONObj doc,
+    FieldParser::FieldState FieldParser::extractNumber(BSONObj doc,
                                     const BSONField<int>& field,
-                                    const int& def,
                                     int* out,
                                     string* errMsg)
     {
         BSONElement elem = doc[field.name()];
         if (elem.eoo()) {
-            *out = def;
-            return true;
+            if (field.hasDefault()) {
+                *out = field.getDefault();
+                return FIELD_DEFAULT;
+            }
+            else {
+                return FIELD_NONE;
+            }
         }
 
         if (elem.isNumber()) {
             *out = elem.numberInt();
-            return true;
+            return FIELD_SET;
         }
 
         _genFieldErrMsg(doc, field, "number", errMsg);
-        return false;
+        return FIELD_INVALID;
     }
 
-    bool FieldParser::extract(BSONObj doc,
+    FieldParser::FieldState FieldParser::extract(BSONObj doc,
                               const BSONField<long long>& field,
-                              const long long& def,
                               long long* out,
                               string* errMsg)
     {
         BSONElement elem = doc[field.name()];
         if (elem.eoo()) {
-            *out = def;
-            return true;
+            if (field.hasDefault()) {
+                *out = field.getDefault();
+                return FIELD_DEFAULT;
+            }
+            else {
+                return FIELD_NONE;
+            }
         }
 
         if (elem.type() == NumberLong) {
             *out = elem.numberLong();
-            return true;
+            return FIELD_SET;
         }
 
         _genFieldErrMsg(doc, field, "long", errMsg);
-        return false;
+        return FIELD_INVALID;
     }
 
-    bool FieldParser::extractNumber(BSONObj doc,
+    FieldParser::FieldState FieldParser::extractNumber(BSONObj doc,
                                     const BSONField<long long>& field,
-                                    const long long& def,
                                     long long* out,
                                     string* errMsg)
     {
         BSONElement elem = doc[field.name()];
         if (elem.eoo()) {
-            *out = def;
-            return true;
+            if (field.hasDefault()) {
+                *out = field.getDefault();
+                return FIELD_DEFAULT;
+            }
+            else {
+                return FIELD_NONE;
+            }
         }
 
         if (elem.isNumber()) {
             *out = elem.numberLong();
-            return true;
+            return FIELD_SET;
         }
 
         _genFieldErrMsg(doc, field, "number", errMsg);
-        return false;
+        return FIELD_INVALID;
     }
 
 } // namespace mongo

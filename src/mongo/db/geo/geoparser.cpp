@@ -18,17 +18,15 @@
 #include <vector>
 #include "mongo/db/jsobj.h"
 #include "mongo/db/geo/geoparser.h"
+#include "mongo/util/mongoutils/str.h"
 #include "third_party/s2/s2.h"
+#include "third_party/s2/s2cap.h"
 #include "third_party/s2/s2cell.h"
 #include "third_party/s2/s2latlng.h"
 #include "third_party/s2/s2loop.h"
 #include "third_party/s2/s2polygon.h"
 #include "third_party/s2/s2polygonbuilder.h"
 #include "third_party/s2/s2polyline.h"
-
-// TODO(hk): Modify S2 library to make DCHECKS work like fassert.
-// TODO(hk): Consider moving s/field_parser.cpp into its own library and make use of it instead of
-// doing it ourselves.
 
 namespace mongo {
     // This field must be present, and...
@@ -68,6 +66,9 @@ namespace mongo {
             for (size_t j = 0; j < thisCoord.size(); ++j) {
                 if (!thisCoord[j].isNumber()) { return false; }
             }
+            // ...where the latitude is valid
+            double lat = thisCoord[1].Number();
+            if (lat < -90 || lat > 90) { return false; }
         }
         return true;
     }
@@ -98,12 +99,20 @@ namespace mongo {
 
         const vector<BSONElement>& coordinates = coordElt.Array();
         if (coordinates.size() != 2) { return false; }
-        return coordinates[0].isNumber() && coordinates[1].isNumber();
+        if (!coordinates[0].isNumber() || !coordinates[1].isNumber()) { return false; }
+        double lat = coordinates[1].Number();
+        return lat >= -90 && lat <= 90;
     }
 
     void GeoParser::parseGeoJSONPoint(const BSONObj& obj, S2Cell* out) {
         S2Point point = coordsToPoint(obj.getFieldDotted(GEOJSON_COORDINATES).Array());
         *out = S2Cell(point);
+    }
+
+    void GeoParser::parseGeoJSONPoint(const BSONObj& obj, Point* out) {
+        const vector<BSONElement>& coords = obj.getFieldDotted(GEOJSON_COORDINATES).Array();
+        out->x = coords[0].Number();
+        out->y = coords[1].Number();
     }
 
     void GeoParser::parseGeoJSONPoint(const BSONObj& obj, S2Point* out) {
@@ -126,7 +135,10 @@ namespace mongo {
 
         const vector<BSONElement>& coordinateArray = coordElt.Array();
         if (coordinateArray.size() < 2) { return false; }
-        return isArrayOfCoordinates(coordinateArray);
+        if (!isArrayOfCoordinates(coordinateArray)) { return false; }
+        vector<S2Point> vertices;
+        parsePoints(obj.getFieldDotted(GEOJSON_COORDINATES).Array(), &vertices);
+        return S2Polyline::IsValid(vertices);
     }
 
     void GeoParser::parseGeoJSONLineString(const BSONObj& obj, S2Polyline* out) {
@@ -163,27 +175,6 @@ namespace mongo {
         return true;
     }
 
-    void fixOrientationTo(vector<S2Point>* points, const bool wantClockwise) {
-        const vector<S2Point>& pointsRef = *points;
-        massert(16463, "Don't have enough points in S2 orientation fixing to work with",
-                4 <= points->size());
-        double sum = 0;
-        // Sum the area under the curve...well really, it's twice the area.
-        for (size_t i = 0; i < pointsRef.size(); ++i) {
-            // TODO(hk): Convince yourself thoroughly that this is right.
-            S2Point a = pointsRef[i];
-            S2Point b = pointsRef[(i + 1) % pointsRef.size()];
-            sum += (b[1] - a[1]) * (b[0] - a[0]);
-        }
-        // If sum > 0, clockwise
-        // If sum < 0, counter-clockwise
-        bool isClockwise = sum > 0;
-        if (isClockwise != wantClockwise) {
-            vector<S2Point> reversed(pointsRef.rbegin(), pointsRef.rend());
-            *points = reversed;
-        }
-    }
-
     void GeoParser::parseGeoJSONPolygon(const BSONObj& obj, S2Polygon* out) {
         const vector<BSONElement>& coordinates =
             obj.getFieldDotted(GEOJSON_COORDINATES).Array();
@@ -191,27 +182,54 @@ namespace mongo {
         const vector<BSONElement>& exteriorRing = coordinates[0].Array();
         vector<S2Point> exteriorVertices;
         parsePoints(exteriorRing, &exteriorVertices);
-
-        // The exterior ring must be counter-clockwise.  We fix it up for the user.
-        fixOrientationTo(&exteriorVertices, false);
+        // The last point is duplicated.  We drop it, since S2Loop expects no
+        // duplicate points
+        exteriorVertices.resize(exteriorVertices.size() - 1);
 
         S2PolygonBuilderOptions polyOptions;
         polyOptions.set_validate(true);
+        // Don't silently eliminate duplicate edges.
+        polyOptions.set_xor_edges(false);
         S2PolygonBuilder polyBuilder(polyOptions);
         S2Loop exteriorLoop(exteriorVertices);
+        exteriorLoop.Normalize();
+        if (exteriorLoop.is_hole()) {
+            exteriorLoop.Invert();
+        }
+        uassert(16693, "Exterior shell of polygon is invalid: " + obj.toString(),
+                exteriorLoop.IsValid());
         polyBuilder.AddLoop(&exteriorLoop);
 
         // Subsequent arrays of coordinates are interior rings/holes.
         for (size_t i = 1; i < coordinates.size(); ++i) {
             vector<S2Point> holePoints;
             parsePoints(coordinates[i].Array(), &holePoints);
+            // Drop the duplicated last point.
+            holePoints.resize(holePoints.size() - 1);
             // Interior rings are clockwise.
-            fixOrientationTo(&holePoints, true);
             S2Loop holeLoop(holePoints);
+            holeLoop.Normalize();
+            uassert(16694, "Interior hole of polygon is invalid: " + obj.toString(),
+                    holeLoop.IsValid());
+            if (!holeLoop.is_hole()) {
+                holeLoop.Invert();
+            }
             polyBuilder.AddLoop(&holeLoop);
         }
 
-        polyBuilder.AssemblePolygon(out, NULL);
+        uassert(16695, "Couldn't assemble polygon: " + obj.toString(),
+                polyBuilder.AssemblePolygon(out, NULL));
+    }
+
+    bool GeoParser::parsePoint(const BSONObj &obj, Point *out) {
+        if (isGeoJSONPoint(obj)) {
+            parseGeoJSONPoint(obj, out);
+            return true;
+        } else if (isLegacyPoint(obj)) {
+            parseLegacyPoint(obj, out);
+            return true;
+        }
+        return false;
     }
 
     bool GeoParser::parsePoint(const BSONObj &obj, S2Point *out) {
@@ -250,34 +268,9 @@ namespace mongo {
         *out = coordToPoint(x.number(), y.number());
     }
 
-    void GeoParser::parseLegacyPolygon(const BSONObj &obj, S2Polygon *out) {
-        vector<S2Point> points;
-
-        BSONObjIterator coordIt(obj);
-        while (coordIt.more()) {
-            BSONElement coord = coordIt.next();
-            S2Point point;
-            parseLegacyPoint(coord.Obj(), &point);
-            points.push_back(point);
-        }
-        points.push_back(points[0]);
-
-        fixOrientationTo(&points, false);
-
-        S2PolygonBuilderOptions polyOptions;
-        polyOptions.set_validate(true);
-        S2PolygonBuilder polyBuilder(polyOptions);
-        S2Loop exteriorLoop(points);
-        polyBuilder.AddLoop(&exteriorLoop);
-        polyBuilder.AssemblePolygon(out, NULL);
-    }
-
     bool GeoParser::parsePolygon(const BSONObj &obj, S2Polygon *out) {
         if (isGeoJSONPolygon(obj)) {
             parseGeoJSONPolygon(obj, out);
-            return true;
-        } else if (isLegacyPolygon(obj)) {
-            parseLegacyPolygon(obj, out);
             return true;
         } else {
             return false;
@@ -297,7 +290,11 @@ namespace mongo {
     }
 
     bool GeoParser::isLegacyPolygon(const BSONObj &obj) {
-        BSONObjIterator coordIt(obj);
+        BSONObjIterator typeIt(obj);
+        BSONElement type = typeIt.next();
+        if (!type.isABSONObj()) { return false; }
+        if (!mongoutils::str::equals(type.fieldName(), "$polygon")) { return false; }
+        BSONObjIterator coordIt(type.embeddedObject());
         int vertices = 0;
         while (coordIt.more()) {
             BSONElement coord = coordIt.next();
@@ -353,7 +350,11 @@ namespace mongo {
     }
 
     bool GeoParser::isLegacyBox(const BSONObj &obj) {
-        BSONObjIterator coordIt(obj);
+        BSONObjIterator typeIt(obj);
+        BSONElement type = typeIt.next();
+        if (!type.isABSONObj()) { return false; }
+        if (!mongoutils::str::equals(type.fieldName(), "$box")) { return false; }
+        BSONObjIterator coordIt(type.embeddedObject());
         BSONElement minE = coordIt.next();
         if (!minE.isABSONObj()) { return false; }
         if (!isLegacyPoint(minE.Obj())) { return false; }
@@ -365,7 +366,9 @@ namespace mongo {
     }
 
     void GeoParser::parseLegacyBox(const BSONObj &obj, Box *out) {
-        BSONObjIterator coordIt(obj);
+        BSONObjIterator typeIt(obj);
+        BSONElement type = typeIt.next();
+        BSONObjIterator coordIt(type.embeddedObject());
         BSONElement minE = coordIt.next();
         BSONElement maxE = coordIt.next();
         parseLegacyPoint(minE.Obj(), &out->_min);
@@ -373,7 +376,12 @@ namespace mongo {
     }
 
     bool GeoParser::isLegacyCenter(const BSONObj &obj) {
-        BSONObjIterator objIt(obj);
+        BSONObjIterator typeIt(obj);
+        BSONElement type = typeIt.next();
+        if (!type.isABSONObj()) { return false; }
+        bool isCenter = mongoutils::str::equals(type.fieldName(), "$center");
+        if (!isCenter) { return false; }
+        BSONObjIterator objIt(type.embeddedObject());
         BSONElement center = objIt.next();
         if (!center.isABSONObj()) { return false; }
         if (!isLegacyPoint(center.Obj())) { return false; }
@@ -383,22 +391,60 @@ namespace mongo {
         return true;
     }
 
-    void GeoParser::parseLegacyCenter(const BSONObj &obj, Point *centerOut, double *radiusOut) {
-        BSONObjIterator objIt(obj);
+    void GeoParser::parseLegacyCenter(const BSONObj &obj, Circle *out) {
+        BSONObjIterator typeIt(obj);
+        BSONElement type = typeIt.next();
+        BSONObjIterator objIt(type.embeddedObject());
         BSONElement center = objIt.next();
-        parseLegacyPoint(center.Obj(), centerOut);
+        parseLegacyPoint(center.Obj(), &out->center);
         BSONElement radius = objIt.next();
-        *radiusOut = radius.number();
+        out->radius = radius.number();
+    }
+
+    bool GeoParser::isLegacyCenterSphere(const BSONObj &obj) {
+        BSONObjIterator typeIt(obj);
+        BSONElement type = typeIt.next();
+        if (!type.isABSONObj()) { return false; }
+        bool isCenterSphere = mongoutils::str::equals(type.fieldName(), "$centerSphere");
+        if (!isCenterSphere) { return false; }
+        BSONObjIterator objIt(type.embeddedObject());
+        BSONElement center = objIt.next();
+        if (!center.isABSONObj()) { return false; }
+        if (!isLegacyPoint(center.Obj())) { return false; }
+        if (!objIt.more()) { return false; }
+        BSONElement radius = objIt.next();
+        if (!radius.isNumber()) { return false; }
+        return true;
+    }
+
+    void GeoParser::parseLegacyCenterSphere(const BSONObj &obj, S2Cap *out) {
+        BSONObjIterator typeIt(obj);
+        BSONElement type = typeIt.next();
+        BSONObjIterator objIt(type.embeddedObject());
+        BSONElement center = objIt.next();
+        S2Point centerPoint;
+        parseLegacyPoint(center.Obj(), &centerPoint);
+        BSONElement radiusElt = objIt.next();
+        double radius = radiusElt.number();
+        *out = S2Cap::FromAxisAngle(centerPoint, S1Angle::Radians(radius));
     }
 
     void GeoParser::parseLegacyPolygon(const BSONObj &obj, Polygon *out) {
+        BSONObjIterator typeIt(obj);
+        BSONElement type = typeIt.next();
+        BSONObjIterator coordIt(type.embeddedObject());
         vector<Point> points;
-        BSONObjIterator coordIt(obj);
         while (coordIt.more()) {
             Point p;
             parseLegacyPoint(coordIt.next().Obj(), &p);
             points.push_back(p);
         }
         *out = Polygon(points);
+    }
+
+    bool GeoParser::parsePolygon(const BSONObj &obj, Polygon *out) {
+        if (!isLegacyPolygon(obj)) { return false; }
+        parseLegacyPolygon(obj, out);
+        return true;
     }
 }  // namespace mongo

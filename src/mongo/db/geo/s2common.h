@@ -14,6 +14,7 @@
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#include "mongo/db/diskloc.h"
 #include "mongo/db/geo/geoparser.h"
 #include "third_party/s2/s2.h"
 #include "third_party/s2/s2regioncoverer.h"
@@ -30,51 +31,14 @@ namespace mongo {
     public:
         // Given a coverer, region, and field name, generate a BSONObj that we can pass to a
         // FieldRangeSet so that we only examine the keys that the provided region may intersect.
-        static BSONObj coverAsBSON(S2RegionCoverer *coverer, const S2Region &region,
-                                   const string& field);
-    };
-
-    // Used for passing geo data from the newCursor entry point to the S2Cursor class.
-    struct QueryGeometry {
-        QueryGeometry(const string& f) : field(f), predicate(INTERSECT) {}
-        enum Predicate {
-            WITHIN,
-            INTERSECT,
-        };
-
-        // Name of the field in the query.
-        string field;
-        // Only one of these should be non-NULL.  S2Region is a superclass but it only supports
-        // testing against S2Cells.  We need the most specific class we can get.
-        // Owned by S2Cursor.
-        shared_ptr<S2Cell> cell;
-        shared_ptr<S2Polyline> line;
-        shared_ptr<S2Polygon> polygon;
-        Predicate predicate;
-
-        string toString() const;
-
-        bool satisfiesPredicate(const BSONObj &obj);
-        
-        // Does this QueryGeometry intersect the provided data?  Sadly there is no common good way
-        // to check this, so we do different things for all query/data pairs.
-        bool intersects(const S2Cell& otherPoint);
-        bool intersects(const S2Polyline& otherLine);
-        bool intersects(const S2Polygon& otherPolygon);
-        // And, within.
-        bool isWithin(const S2Cell& otherPoint);
-        bool isWithin(const S2Polyline& otherLine);
-        bool isWithin(const S2Polygon& otherPolygon);
-
-        // One region is not NULL and this returns it.
-        const S2Region& getRegion() const;
-        // Get the centroid, boring if we're a point, interesting if we're not.
-        S2Point getCentroid() const;
-        // Try to parse the provided object into the right place.
-        bool parseFrom(const BSONObj &obj);
+        static BSONObj coverAsBSON(const vector<S2CellId> &cover, const string& field,
+                                   const int coarsestIndexedLevel);
+        static void setCoverLimitsBasedOnArea(double area, S2RegionCoverer *coverer, int coarsestIndexedLevel);
     };
 
     struct S2IndexingParams {
+        static const double kRadiusOfEarthInMeters;
+
         // Since we take the cartesian product when we generate keys for an insert,
         // we need a cap.
         size_t maxKeysPerInsert;

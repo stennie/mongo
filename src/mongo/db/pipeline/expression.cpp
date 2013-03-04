@@ -365,10 +365,8 @@ namespace mongo {
                 return Value(BSONNULL);
             }
             else {
-                // leaving explicit checks for now since these were supported in alpha releases
-                uassert(16416, "$add does not support strings",
-                        val.getType() != String);
-                uasserted(16554, "$add only supports numeric or date types");
+                uasserted(16554, str::stream() << "$add only supports numeric or date types, not "
+                                               << typeName(val.getType()));
             }
         }
 
@@ -743,6 +741,13 @@ namespace mongo {
         StringBuilder result;
         for (size_t i = 0; i < n; ++i) {
             Value val = vpOperand[i]->evaluate(input);
+            if (val.nullish())
+                return Value(BSONNULL);
+
+            uassert(16702, str::stream() << "$concat only supports strings, not "
+                                         << typeName(val.getType()),
+                    val.getType() == String);
+
             result << val.coerceToString();
         }
 
@@ -996,9 +1001,10 @@ namespace mongo {
             return Value(BSONNULL);
         }
         else {
-            uassert(16373, "$divide does not support dates",
-                    lhs.getType() != Date && rhs.getType() != Date);
-            uasserted(16609, "$divide only supports numeric types");
+            uasserted(16609, str::stream() << "$divide only supports numeric types, not "
+                                           << typeName(lhs.getType())
+                                           << " and "
+                                           << typeName(rhs.getType()));
         }
     }
 
@@ -1833,9 +1839,10 @@ namespace mongo {
             return Value(BSONNULL);
         }
         else {
-            uassert(16374, "$mod does not support dates",
-                    leftType != Date && rightType != Date);
-            uasserted(16611, "$mod only supports numeric types");
+            uasserted(16611, str::stream() << "$mod only supports numeric types, not "
+                                           << typeName(lhs.getType())
+                                           << " and "
+                                           << typeName(rhs.getType()));
         }
     }
 
@@ -1912,9 +1919,8 @@ namespace mongo {
                 return Value(BSONNULL);
             }
             else {
-                uassert(16375, "$multiply does not support dates",
-                        val.getType() != Date);
-                uasserted(16555, "$mutiply only supports numeric types");
+                uasserted(16555, str::stream() << "$multiply only supports numeric types, not "
+                                               << typeName(val.getType()));
             }
         }
 
@@ -2505,12 +2511,10 @@ namespace mongo {
             }
         }
         else {
-            if (rhs.getType()) {
-                uasserted(16614, str::stream() << "cant $subtract a Date from a "
-                                               << typeName(rhs.getType()));
-            }
-
-            uasserted(16556, "$subtract only supports numeric or Date types");
+            uasserted(16556, str::stream() << "cant $subtract a"
+                                           << typeName(rhs.getType())
+                                           << " from a "
+                                           << typeName(lhs.getType()));
         }
     }
 

@@ -152,6 +152,7 @@ add_option( "32" , "whether to force 32 bit" , 0 , True , "force32" )
 
 add_option( "cxx", "compiler to use" , 1 , True )
 add_option( "cc", "compiler to use for c" , 1 , True )
+add_option( "ld", "linker to use" , 1 , True )
 
 add_option( "cpppath", "Include path if you have headers in a nonstandard directory" , 1 , True )
 add_option( "libpath", "Library path if you have libraries in a nonstandard directory" , 1 , True )
@@ -342,6 +343,9 @@ elif has_option("clang"):
 
 if has_option( "cc" ):
     env["CC"] = get_option( "cc" )
+
+if has_option( "ld" ):
+    env["LINK"] = get_option( "ld" )
 
 if env['PYSYSPLATFORM'] in ('linux2', 'freebsd'):
     env['LINK_LIBGROUP_START'] = '-Wl,--start-group'
@@ -900,6 +904,8 @@ elif not onlyServer:
     if windows:
         shellEnv.Append( LIBS=["winmm.lib"] )
 
+enforce_glibc = linux and has_option("release") and not has_option("no-glibc-check")
+
 def checkErrorCodes():
     import buildscripts.errorcodes as x
     if x.checkErrorCodes() == False:
@@ -1125,6 +1131,7 @@ Export("usesm usev8")
 Export("darwin windows solaris linux freebsd nix")
 Export('module_sconscripts')
 Export("debugBuild")
+Export("enforce_glibc")
 
 env.SConscript('src/SConscript', variant_dir='$BUILD_DIR', duplicate=False)
 env.SConscript('src/SConscript.client', variant_dir='$BUILD_DIR/client_build', duplicate=False)

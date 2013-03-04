@@ -17,40 +17,32 @@
 #include "mongo/db/geo/s2common.h"
 
 namespace mongo {
+    // Thanks, Wikipedia.
+    const double S2IndexingParams::kRadiusOfEarthInMeters = (6378.1 * 1000);
+
     static string myitoa(int d) {
         stringstream ss;
         ss << d;
         return ss.str();
     }
 
-    BSONObj S2SearchUtil::coverAsBSON(S2RegionCoverer *coverer, const S2Region& region,
-                                      const string& field) {
+    void S2SearchUtil::setCoverLimitsBasedOnArea(double area, S2RegionCoverer *coverer,
+                                                 int coarsestIndexedLevel) {
+        area = sqrt(area);
+        coverer->set_min_level(min(coarsestIndexedLevel, 2 + S2::kAvgEdge.GetClosestLevel(area)));
+        coverer->set_max_level(4 + coverer->min_level());
+    }
+
+    BSONObj S2SearchUtil::coverAsBSON(const vector<S2CellId> &cover, const string& field,
+                                      const int coarsestIndexedLevel) {
         BSONObjBuilder queryBuilder;
         BSONObjBuilder inBuilder(queryBuilder.subobjStart(field));
         // To have an array where elements of that array are regexes, we have to do this.
         BSONObjBuilder inArrayBuilder(inBuilder.subarrayStart("$in"));
-        // Sadly we must keep track of this ourselves.  Oh, BSONObjBuilder, you rascsal!
+        // Sadly we must keep track of this ourselves.  Oh, BSONObjBuilder, you rascal!
         int arrayPos = 0;
 
-        bool considerCoarser = true;
-        vector<S2CellId> cover;
-        coverer->GetCovering(region, &cover);
-        if (cover.size() > 5000) {
-            int oldCoverSize = cover.size();
-            int oldMaxLevel = coverer->max_level();
-            coverer->set_max_level(coverer->min_level());
-            coverer->set_min_level(3 * coverer->min_level() / 4);
-            // Our finest level is the coarsest level in the index, so don't look coarser because
-            // there's nothing there.
-            considerCoarser = false;
-            coverer->GetCovering(region, &cover);
-            LOG(2) << "Trying to create BSON indexing obj w/too many regions = " << oldCoverSize
-                   << endl;
-            LOG(2) << "Modifying coverer from (" << coverer->max_level() << "," << oldMaxLevel
-                   << ") to (" << coverer->min_level() << "," << coverer->max_level() << ")"
-                   << endl;
-            LOG(2) << "New #regions = " << cover.size() << endl;
-        }
+        bool considerCoarser = false;
 
         // Look at the cells we cover and all cells that are within our covering and
         // finer.  Anything with our cover as a strict prefix is contained within the cover and
@@ -59,6 +51,9 @@ namespace mongo {
             // First argument is position in the array as a string.
             // Third argument is options to regex.
             inArrayBuilder.appendRegex(myitoa(arrayPos++), "^" + cover[i].toString(), "");
+            // If any of our covers could be covered by something in the index, we have
+            // to look at things coarser.
+            considerCoarser = considerCoarser || (cover[i].level() > coarsestIndexedLevel);
         }
 
         if (considerCoarser) {
@@ -75,15 +70,15 @@ namespace mongo {
             // And we've already looked at points with the cell id 211111 from the regex search
             // created above, so we only want things where the value of the last digit is not
             // stored (and therefore could be 1).
-            set<S2CellId> parents;
+            unordered_set<S2CellId> parents;
             for (size_t i = 0; i < cover.size(); ++i) {
-                for (S2CellId id = cover[i].parent(); id.level() >= coverer->min_level();
+                for (S2CellId id = cover[i].parent(); id.level() >= coarsestIndexedLevel;
                         id = id.parent()) {
                     parents.insert(id);
                 }
             }
 
-            for (set<S2CellId>::const_iterator it = parents.begin(); it != parents.end(); ++it) {
+            for (unordered_set<S2CellId>::const_iterator it = parents.begin(); it != parents.end(); ++it) {
                 inArrayBuilder.append(myitoa(arrayPos++), it->toString());
             }
         }
@@ -91,172 +86,5 @@ namespace mongo {
         inArrayBuilder.done();
         inBuilder.done();
         return queryBuilder.obj();
-    }
-
-    string QueryGeometry::toString() const {
-        stringstream ss;
-        ss << "field = " << field;
-        ss << ", predicate = " << ((WITHIN == predicate) ? "within" : "intersect");
-        if (NULL != cell.get()) {
-            ss << ", cell";
-        } else if (NULL != line.get()) {
-            ss << ", line";
-        } else if (NULL != polygon.get()) {
-            ss << ", polygon";
-        }
-        return ss.str();
-    }
-
-    bool QueryGeometry::satisfiesPredicate(const BSONObj &obj) {
-        verify(predicate == WITHIN || predicate == INTERSECT);
-
-        if (GeoParser::isPolygon(obj)) {
-            S2Polygon shape;
-            GeoParser::parsePolygon(obj, &shape);
-            if (WITHIN == predicate) {
-                return isWithin(shape);
-            } else {
-                return intersects(shape);
-            }
-        } else if (GeoParser::isLineString(obj)) {
-            S2Polyline shape;
-            GeoParser::parseLineString(obj, &shape);
-            if (WITHIN == predicate) {
-                return isWithin(shape);
-            } else {
-                return intersects(shape);
-            }
-        } else if (GeoParser::isPoint(obj)) {
-            S2Cell point;
-            GeoParser::parsePoint(obj, &point);
-            if (WITHIN == predicate) {
-                return isWithin(point);
-            } else {
-                return intersects(point);
-            }
-        }
-        return false;
-    }
-
-    bool QueryGeometry::parseFrom(const BSONObj& obj) {
-        if (GeoParser::isGeoJSONPolygon(obj)) {
-            // We can't really pass these things around willy-nilly except by ptr.
-            polygon.reset(new S2Polygon());
-            GeoParser::parseGeoJSONPolygon(obj, polygon.get());
-        } else if (GeoParser::isPoint(obj)) {
-            cell.reset(new S2Cell());
-            GeoParser::parsePoint(obj, cell.get());
-        } else if (GeoParser::isLineString(obj)) {
-            line.reset(new S2Polyline());
-            GeoParser::parseLineString(obj, line.get());
-        } else {
-            return false;
-        }
-        return true;
-    }
-
-    // Is the geometry provided as an argument within our query geometry?
-    bool QueryGeometry::isWithin(const S2Cell &otherPoint) {
-        // Intersecting a point is containing a point.  Hooray!
-        return intersects(otherPoint);
-    }
-
-    bool QueryGeometry::isWithin(const S2Polyline& otherLine) {
-        if (NULL != cell) {
-            // Points don't contain lines.
-            return false;
-        } else if (NULL != line) {
-            // Doing line-in-line is scary.
-            return false;
-        } else {
-            // Kind of a mess.  We get a function for clipping the line to the
-            // polygon.  We do this and make sure the line is the same as the
-            // line we're clipping against.
-            vector<S2Polyline*> clipped;
-            polygon->IntersectWithPolyline(&otherLine, &clipped);
-            if (1 != clipped.size()) { return false; }
-            // If the line is entirely contained within the polygon, we should be
-            // getting it back verbatim, so really there should be no error.
-            bool ret = clipped[0]->NearlyCoversPolyline(otherLine, S1Angle::Degrees(1e-10));
-            for (size_t i = 0; i < clipped.size(); ++i) delete clipped[i];
-            return ret;
-        }
-    }
-
-    bool QueryGeometry::isWithin(const S2Polygon& otherPolygon) {
-        if (NULL != cell) {
-            // Points don't contain polygons.
-            return false;
-        } else if (NULL != line) {
-            // Lines don't contain polygons
-            return false;
-        } else {
-            return polygon->Contains(&otherPolygon);
-        }
-    }
-
-    // Does this (QueryGeometry) intersect the provided data?
-    bool QueryGeometry::intersects(const S2Cell &otherPoint) {
-        if (NULL != cell) {
-            return cell->MayIntersect(otherPoint);
-        } else if (NULL != line) {
-            return line->MayIntersect(otherPoint);
-        } else {
-            return polygon->MayIntersect(otherPoint);
-        }
-    }
-
-    bool QueryGeometry::intersects(const S2Polyline& otherLine) {
-        if (NULL != cell) {
-            return otherLine.MayIntersect(*cell);
-        } else if (NULL != line) {
-            return otherLine.Intersects(line.get());
-        } else {
-            // TODO(hk): modify s2 library to just let us know if it intersected
-            // rather than returning all this.
-            vector<S2Polyline*> clipped;
-            polygon->IntersectWithPolyline(&otherLine, &clipped);
-            bool ret = clipped.size() > 0;
-            for (size_t i = 0; i < clipped.size(); ++i) delete clipped[i];
-            return ret;
-        }
-    }
-
-    bool QueryGeometry::intersects(const S2Polygon& otherPolygon) {
-        if (NULL != cell) {
-            return otherPolygon.MayIntersect(*cell);
-        } else if (NULL != line) {
-            // TODO(hk): modify s2 library to just let us know if it intersected
-            // rather than returning all this.
-            vector<S2Polyline*> clipped;
-            otherPolygon.IntersectWithPolyline(line.get(), &clipped);
-            bool ret = clipped.size() > 0;
-            for (size_t i = 0; i < clipped.size(); ++i) delete clipped[i];
-            return ret;
-        } else {
-            return otherPolygon.Intersects(polygon.get());
-        }
-    }
-
-    S2Point QueryGeometry::getCentroid() const {
-        if (NULL != cell) {
-            return cell->GetCenter();
-        } else if (NULL != line) {
-            return line->GetCentroid();
-        } else {
-            verify(NULL != polygon);
-            return polygon->GetCentroid();
-        }
-    }
-
-    const S2Region& QueryGeometry::getRegion() const {
-        if (NULL != cell) {
-            return *cell;
-        } else if (NULL != line) {
-            return *line;
-        } else {
-            verify(NULL != polygon);
-            return *polygon;
-        }
     }
 }  // namespace mongo

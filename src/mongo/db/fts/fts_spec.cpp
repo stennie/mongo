@@ -29,7 +29,7 @@ namespace mongo {
         using namespace mongoutils;
 
         const double MAX_WEIGHT = 1000000000.0;
-
+        const double MAX_WORD_WEIGHT = MAX_WEIGHT / 10000;
 
         FTSSpec::FTSSpec( const BSONObj& indexInfo ) {
             _defaultLanguage = indexInfo["default_language"].valuestrsafe();
@@ -55,7 +55,7 @@ namespace mongo {
                     else {
                         double num = e.number();
                         _weights[ e.fieldName() ] = num;
-                        verify( num > 0 && num < MAX_WEIGHT );
+                        verify( num > 0 && num < MAX_WORD_WEIGHT );
                     }
                 }
                 verify( _wildcard || _weights.size() );
@@ -265,13 +265,13 @@ namespace mongo {
                 if ( e.eoo() )
                     return Status( ErrorCodes::BadValue,
                                    str::stream()
-                                   << "need have an eaulity filter on: "
+                                   << "need have an equality filter on: "
                                    << extraBefore(i) );
 
                 if ( e.isABSONObj() && e.Obj().firstElement().getGtLtOp( -1 ) != -1 )
                     return Status( ErrorCodes::BadValue,
                                    str::stream()
-                                   << "need have an eaulity filter on: "
+                                   << "need have an equality filter on: "
                                    << extraBefore(i) );
 
                 b.append( e );
@@ -336,8 +336,11 @@ namespace mongo {
             BSONObj weights;
             {
                 BSONObjBuilder b;
-                for ( map<string,int>::iterator i = m.begin(); i != m.end(); ++i )
+                for ( map<string,int>::iterator i = m.begin(); i != m.end(); ++i ) {
+                    uassert( 16674, "score for word too high",
+                             i->second > 0 && i->second < MAX_WORD_WEIGHT );
                     b.append( i->first, i->second );
+                }
                 weights = b.obj();
             }
 
@@ -349,7 +352,8 @@ namespace mongo {
             if ( language_override.empty() )
                 language_override = "language";
 
-            int version = 0;
+            int version = -1;
+            int textIndexVersion = 1;
 
             BSONObjBuilder b;
             BSONObjIterator i( spec );
@@ -373,6 +377,10 @@ namespace mongo {
                 else if ( str::equals( e.fieldName(), "v" ) ) {
                     version = e.numberInt();
                 }
+                else if ( str::equals( e.fieldName(), "textIndexVersion" ) ) {
+                    textIndexVersion = e.numberInt();
+                }
+
                 else {
                     b.append( e );
                 }
@@ -385,7 +393,10 @@ namespace mongo {
             if ( !language_override.empty() )
                 b.append( "language_override", language_override);
 
-            b.append( "v", version );
+            if ( version >= 0 )
+                b.append( "v", version );
+
+            b.append( "textIndexVersion", textIndexVersion );
 
             return b.obj();
 

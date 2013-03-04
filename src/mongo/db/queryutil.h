@@ -20,6 +20,7 @@
 #include "jsobj.h"
 #include "indexkey.h"
 #include "projection.h"
+#include "mongo/client/dbclientinterface.h"
 
 namespace mongo {
     
@@ -156,7 +157,7 @@ namespace mongo {
 
             _filter = _filter.getOwned();
 
-            _hasReadPref = q.hasField("$readPreference");
+            _hasReadPref = q.hasField(Query::ReadPrefField.name());
         }
         
         void _reset() {
@@ -287,12 +288,12 @@ namespace mongo {
             _indexRequired[name] = _indexRequired[name] || (req == INDEX_REQUIRED);
         }
 
-        bool anyRequireIndex() const {
+        bool allRequireIndex() const {
             for (map<string, bool>::const_iterator it = _indexRequired.begin();
                  it != _indexRequired.end(); ++it) {
-                if (it->second) { return true; }
+                if (!it->second) { return false; }
             }
-            return false;
+            return true;
         }
 
         bool empty() const { return _indexRequired.empty(); }

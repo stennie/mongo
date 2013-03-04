@@ -103,7 +103,8 @@ namespace {
          "Certificate Authority file for SSL")
         ("sslCRLFile", po::value<std::string>(&cmdLine.sslCRLFile),
          "Certificate Revocation List file for SSL")
-        ("sslForceCertificateValidation", "require each client to present a valid certificate")
+        ("sslWeakCertificateValidation", "allow client to connect without presenting a certificate")
+        ("sslFIPSMode", "activate FIPS 140-2 mode at startup")
 #endif
         ;
         
@@ -393,7 +394,12 @@ namespace {
                         name,
                         static_cast<ServerParameter*>(NULL));
                 if (NULL == parameter) {
-                    cout << "Illegal --option parameter: \"" << name << "\"" << endl;
+                    cout << "Illegal --setParameter parameter: \"" << name << "\"" << endl;
+                    return false;
+                }
+                if (!parameter->allowedToChangeAtStartup()) {
+                    cout << "Cannot use --setParameter to set \"" << name << "\" at startup" <<
+                        endl;
                     return false;
                 }
                 Status status = parameter->setFromString(value);
@@ -406,26 +412,35 @@ namespace {
         }
 
 #ifdef MONGO_SSL
-        if (params.count("sslForceCertificateValidation")) {
-            cmdLine.sslForceCertificateValidation = true;
+        if (params.count("sslWeakCertificateValidation")) {
+            cmdLine.sslWeakCertificateValidation = true;
         }
         if (params.count("sslOnNormalPorts")) {
             cmdLine.sslOnNormalPorts = true;
             if ( cmdLine.sslPEMKeyFile.size() == 0 ) {
-                log() << "need sslPEMKeyFile" << endl;
+                log() << "need sslPEMKeyFile with sslOnNormalPorts" << endl;
                 return false;
             }
-            if (cmdLine.sslForceCertificateValidation &&
+            if (cmdLine.sslWeakCertificateValidation &&
                 cmdLine.sslCAFile.empty()) {
-                log() << "need sslCAFile with sslForceCertificateValidation" << endl;
+                log() << "need sslCAFile with sslWeakCertificateValidation" << endl;
                 return false;
+            }
+            if (!cmdLine.sslCRLFile.empty() &&
+                cmdLine.sslCAFile.empty()) {
+                log() << "need sslCAFile with sslCRLFile" << endl;
+                return false;
+            }
+            if (params.count("sslFIPSMode")) {
+                cmdLine.sslFIPSMode = true;
             }
         }
         else if (cmdLine.sslPEMKeyFile.size() || 
                  cmdLine.sslPEMKeyPassword.size() ||
                  cmdLine.sslCAFile.size() ||
                  cmdLine.sslCRLFile.size() ||
-                 cmdLine.sslForceCertificateValidation) {
+                 cmdLine.sslWeakCertificateValidation ||
+                 cmdLine.sslFIPSMode) {
             log() << "need to enable sslOnNormalPorts" << endl;
             return false;
         }

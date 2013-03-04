@@ -157,7 +157,10 @@ namespace mongo {
         ::_exit(EXIT_ABRUPT);
     }
 
-    void setupSignals( bool inFork ) {
+    void setupSignalHandlers() {
+        setupSIGTRAPforGDB();
+        setupCoreSignals();
+
         signal(SIGTERM, sighandler);
         signal(SIGINT, sighandler);
 
@@ -180,9 +183,7 @@ namespace mongo {
 
     void init() {
         serverID.init();
-        setupSIGTRAPforGDB();
-        setupCoreSignals();
-        setupSignals( false );
+        setupSignalHandlers();
         Logstream::get().addGlobalTee( new RamLog("global") );
     }
 
@@ -382,7 +383,10 @@ static void processCommandLineOptions(const std::vector<std::string>& argv) {
             ::_exit(EXIT_FAILURE);
         }
 
-        Chunk::MaxChunkSize = csize * 1024 * 1024;
+        if ( !Chunk::setMaxChunkSizeSizeMB( csize ) ) {
+            out() << "MaxChunkSize invalid" << endl;
+            ::_exit(EXIT_FAILURE);
+        }
     }
 
     if ( params.count( "localThreshold" ) ) {

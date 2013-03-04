@@ -29,6 +29,7 @@ _ disallow system* manipulations from the database.
 
 #include <algorithm>
 #include <boost/filesystem/operations.hpp>
+#include <boost/optional/optional.hpp>
 #include <list>
 
 #include "mongo/base/counter.h"
@@ -48,6 +49,7 @@ _ disallow system* manipulations from the database.
 #include "mongo/db/lasterror.h"
 #include "mongo/db/memconcept.h"
 #include "mongo/db/namespace-inl.h"
+#include "mongo/db/namespacestring.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/repl.h"
 #include "mongo/db/replutil.h"
@@ -57,11 +59,23 @@ _ disallow system* manipulations from the database.
 #include "mongo/util/hashtab.h"
 #include "mongo/util/mmap.h"
 #include "mongo/util/processinfo.h"
+#include "mongo/db/stats/timer_stats.h"
+#include "mongo/db/stats/counters.h"
 
 namespace mongo {
 
     BOOST_STATIC_ASSERT( sizeof(Extent)-4 == 48+128 );
     BOOST_STATIC_ASSERT( sizeof(DataFileHeader)-4 == 8192 );
+
+    //The oplog entries inserted
+    static TimerStats oplogInsertStats;
+    static ServerStatusMetricField<TimerStats> displayInsertedOplogEntries(
+                                                    "repl.oplog.insert",
+                                                    &oplogInsertStats );
+    static Counter64 oplogInsertBytesStats;
+    static ServerStatusMetricField<Counter64> displayInsertedOplogEntryBytes(
+                                                    "repl.oplog.insertBytes",
+                                                    &oplogInsertBytesStats );
 
     bool isValidNS( const StringData& ns ) {
         // TODO: should check for invalid characters
@@ -1063,7 +1077,7 @@ namespace mongo {
                 s->nrecords--;
             }
 
-            if ( strstr(ns, ".system.indexes") ) {
+            if (NamespaceString(ns).coll ==  "system.indexes") {
                 /* temp: if in system.indexes, don't reuse, and zero out: we want to be
                    careful until validated more, as IndexDetails has pointers
                    to this disk location.  so an incorrectly done remove would cause
@@ -1276,19 +1290,28 @@ namespace mongo {
     }
 #endif
 #pragma pack(1)
-    struct IDToInsert_ {
+    struct IDToInsert {
         char type;
-        char _id[4];
+        char id[4];
         OID oid;
-        IDToInsert_() {
-            type = (char) jstOID;
-            strcpy(_id, "_id");
-            verify( sizeof(IDToInsert_) == 17 );
+
+        IDToInsert() {
+            type = 0;
         }
-    } idToInsert_;
-    struct IDToInsert : public BSONElement {
-        IDToInsert() : BSONElement( ( char * )( &idToInsert_ ) ) {}
-    } idToInsert;
+
+        bool needed() const { return type > 0; }
+
+        void init() {
+            type = static_cast<char>(jstOID);
+            strcpy( id, "_id" );
+            oid.init();
+            verify( size() == 17 );
+        }
+
+        int size() const { return sizeof( IDToInsert ); }
+
+        const char* rawdata() const { return reinterpret_cast<const char*>( this ); }
+    };
 #pragma pack()
 
     void DataFileMgr::insertAndLog( const char *ns, const BSONObj &o, bool god, bool fromMigrate ) {
@@ -1386,7 +1409,7 @@ namespace mongo {
         uassert( 10095 , "attempt to insert in reserved database name 'system'", sys != ns);
         if ( strstr(ns, ".system.") ) {
             // later:check for dba-type permissions here if have that at some point separate
-            if ( strstr(ns, ".system.indexes" ) )
+            if (NamespaceString(ns).coll == "system.indexes")
                 wouldAddIndex = true;
             else if ( legalClientSystemNS( ns , true ) ) {
                 if ( obuf && strstr( ns , ".system.users" ) ) {
@@ -1425,7 +1448,9 @@ namespace mongo {
                                         const string& tabletoidxns,
                                         const DiskLoc& loc,
                                         bool mayInterrupt) {
-        uassert( 13143 , "can't create index on system.indexes" , tabletoidxns.find( ".system.indexes" ) == string::npos );
+        uassert(13143,
+                "can't create index on system.indexes",
+                NamespaceString(tabletoidxns).coll != "system.indexes");
 
         BSONObj info = loc.obj();
         bool background = info["background"].trueValue();
@@ -1516,6 +1541,13 @@ namespace mongo {
             // clear transient info caches so they refresh; increments nIndexes
             tableToIndex->addIndex(tabletoidxns.c_str());
             getDur().writingInt(tableToIndex->indexBuildsInProgress) -= 1;
+
+            IndexType* indexType = idx.getSpec().getType();
+            const IndexPlugin *plugin = indexType ? indexType->getPlugin() : NULL;
+            if (plugin) {
+                plugin->postBuildHook( idx.getSpec() );
+            }
+
         }
         catch (...) {
             // Generally, this will be called as an exception from building the index bubbles up.
@@ -1614,7 +1646,8 @@ namespace mongo {
             }
         }
 
-        int addID = 0; // 0 if not adding _id; if adding, the length of that new element
+        IDToInsert idToInsert; // only initialized if needed
+
         if( !god ) {
             /* Check if we have an _id field. If we don't, we'll add it.
                Note that btree buckets which we insert aren't BSONObj's, but in that case god==true.
@@ -1630,8 +1663,8 @@ namespace mongo {
 
                 if( addedID )
                     *addedID = true;
-                addID = len;
-                idToInsert_.oid.init();
+
+                idToInsert.init();
                 len += idToInsert.size();
             }
 
@@ -1651,7 +1684,7 @@ namespace mongo {
 
         bool earlyIndex = true;
         DiskLoc loc;
-        if( addID || tableToIndex || d->isCapped() ) {
+        if( idToInsert.needed() || tableToIndex || d->isCapped() ) {
             // if need id, we don't do the early indexing. this is not the common case so that is sort of ok
             earlyIndex = false;
             loc = allocateSpaceForANewRecord(ns, d, lenWHdr, god);
@@ -1694,11 +1727,12 @@ namespace mongo {
         {
             verify( r->lengthWithHeaders() >= lenWHdr );
             r = (Record*) getDur().writingPtr(r, lenWHdr);
-            if( addID ) {
+            if( idToInsert.needed() ) {
                 /* a little effort was made here to avoid a double copy when we add an ID */
-                ((int&)*r->data()) = *((int*) obuf) + idToInsert.size();
+                int originalSize = *((int*) obuf);
+                ((int&)*r->data()) = originalSize + idToInsert.size();
                 memcpy(r->data()+4, idToInsert.rawdata(), idToInsert.size());
-                memcpy(r->data()+4+idToInsert.size(), ((char *)obuf)+4, addID-4);
+                memcpy(r->data()+4+idToInsert.size(), ((char*)obuf)+4, originalSize-4);
             }
             else {
                 if( obuf ) // obuf can be null from internal callers
@@ -1768,6 +1802,14 @@ namespace mongo {
                  << "fast_oplog_insert requires a capped collection "
                  << " but " << ns << " is not capped",
                  d->isCapped() );
+
+        //record timing on oplog inserts
+        boost::optional<TimerHolder> insertTimer;
+        //skip non-oplog collections
+        if (NamespaceString::oplog(ns)) {
+            insertTimer = boost::in_place(&oplogInsertStats);
+            oplogInsertBytesStats.increment(len); //record len of inserted records for oplog
+        }
 
         int lenWHdr = len + Record::HeaderSize;
         DiskLoc loc = d->alloc(ns, lenWHdr);

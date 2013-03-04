@@ -69,9 +69,9 @@ namespace mongo {
 #elif defined(__APPLE__) && defined(__MACH__)
         enum { SZ = 374 * 1024 };
 #elif defined(__linux__)
-        enum { SZ = 218 * 1024 };
+        enum { SZ = 235 * 1024 };
 #else
-        enum { SZ = 218 * 1024 };   // default size, same as Linux to match old behavior
+        enum { SZ = 235 * 1024 };   // default size, same as Linux to match old behavior
 #endif
         char buf[SZ];
         StackChecker() { 
@@ -80,7 +80,7 @@ namespace mongo {
         void init() { 
             memset(buf, 42, sizeof(buf)); 
         }
-        static void check(const char *tname) { 
+        static void check(StringData tname) {
             static int max;
             StackChecker *sc = checker.get();
             const char *p = sc->buf;
@@ -184,7 +184,7 @@ namespace mongo {
 #if defined(_DEBUG)
         {
             if( sizeof(void*) == 8 ) {
-                StackChecker::check( desc().c_str() );
+                StackChecker::check( desc() );
             }
         }
 #endif

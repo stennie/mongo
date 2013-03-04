@@ -191,10 +191,18 @@ ReplTest.prototype.start = function( master , options , restart, norepl ){
     var o = this.getOptions( master , options , restart, norepl );
 
 
-    if ( restart )
-        return startMongoProgram.apply( null , o );
-    else
-        return startMongod.apply( null , o );
+    if (restart) {
+        return startMongoProgram.apply(null, o);
+    } else {
+        var conn = startMongod.apply(null, o);
+        if (jsTestOptions().keyFile || jsTestOptions().auth) {
+            if (master) {
+                jsTest.addAuth(conn);
+            }
+            jsTest.authenticate(conn);
+        }
+        return conn;
+    }
 }
 
 ReplTest.prototype.stop = function( master , signal ){

@@ -28,6 +28,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/index_update.h"
 #include "mongo/db/instance.h"
+#include "mongo/db/namespacestring.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/queryoptimizer.h"
@@ -98,10 +99,10 @@ namespace mongo {
                 theReplSet->lastOpTimeWritten = ts;
                 theReplSet->lastH = h;
                 ctx.getClient()->setLastOp( ts );
-
-                replset::BackgroundSync::notify();
             }
         }
+
+        OpTime::setLast( ts );
     }
 
     /** given a BSON object, create a new one at dst which is the existing (partial) object
@@ -764,8 +765,7 @@ namespace mongo {
         if ( *opType == 'i' ) {
             opCounters->gotInsert();
 
-            const char *p = strchr(ns, '.');
-            if ( p && strcmp(p, ".system.indexes") == 0 ) {
+            if (NamespaceString(ns).coll == "system.indexes") {
                 // updates aren't allowed for indexes -- so we will do a regular insert. if index already
                 // exists, that is ok.
                 theDataFileMgr.insert(ns, (void*) o.objdata(), o.objsize());
@@ -889,9 +889,9 @@ namespace mongo {
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {
-            ActionSet actions;
-            actions.addAction(ActionType::applyOps);
-            out->push_back(Privilege(AuthorizationManager::SERVER_RESOURCE_NAME, actions));
+            // applyOps can do pretty much anything, so require all privileges.
+            out->push_back(Privilege(PrivilegeSet::WILDCARD_RESOURCE,
+                                     AuthorizationManager::getAllUserActions()));
         }
         virtual bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
 

@@ -6,7 +6,7 @@ t.drop();
 goldenPoint = {type: "Point", coordinates: [ 31.0, 41.0]}
 t.insert({geo: goldenPoint})
 t.ensureIndex({ geo : "2dsphere" })
-resNear = db.runCommand({geoNear : t.getName(), near: [30, 40], num: 1, includeLocs: true})
+resNear = db.runCommand({geoNear : t.getName(), near: [30, 40], num: 1, spherical: true, includeLocs: true})
 assert.eq(resNear.results[0].loc, goldenPoint)
 
 // FYI:
@@ -31,21 +31,21 @@ somepoly = { "type" : "Polygon",
              "coordinates" : [ [ [40,5], [40,6], [41,6], [41,5], [40,5]]]}
 assert.throws(function() { return t.find({ "geo" : { "$near" : { "$geometry" : someline } } }).count()})
 assert.throws(function() { return t.find({ "geo" : { "$near" : { "$geometry" : somepoly } } }).count()})
-assert.throws(function() { return db.runCommand({geoNear : t.getName(), near: someline }).results.length})
-assert.throws(function() { return db.runCommand({geoNear : t.getName(), near: somepoly }).results.length})
+assert.throws(function() { return db.runCommand({geoNear : t.getName(), near: someline, spherical:true }).results.length})
+assert.throws(function() { return db.runCommand({geoNear : t.getName(), near: somepoly, spherical:true }).results.length})
 
 // Do some basic near searches.
 res = t.find({ "geo" : { "$near" : { "$geometry" : origin, $maxDistance: 2000} } }).limit(10)
-resNear = db.runCommand({geoNear : t.getName(), near: [0,0], num: 10, maxDistance: 2000})
+resNear = db.runCommand({geoNear : t.getName(), near: [0,0], num: 10, maxDistance: 2000, spherical: true})
 assert.eq(res.itcount(), resNear.results.length, 10)
 
 res = t.find({ "geo" : { "$near" : { "$geometry" : origin } } }).limit(10)
-resNear = db.runCommand({geoNear : t.getName(), near: [0,0], num: 10})
+resNear = db.runCommand({geoNear : t.getName(), near: [0,0], num: 10, spherical: true})
 assert.eq(res.itcount(), resNear.results.length, 10)
 
 // Find all the points!
 res = t.find({ "geo" : { "$near" : { "$geometry" : origin } } }).limit(10000)
-resNear = db.runCommand({geoNear : t.getName(), near: [0,0], num: 10000})
+resNear = db.runCommand({geoNear : t.getName(), near: [0,0], num: 10000, spherical: true})
 assert.eq(resNear.results.length, res.itcount(), (2 * points) * (2 * points))
 
 // longitude goes -180 to 180
@@ -57,5 +57,28 @@ t.insert({geo: { "type" : "Point", "coordinates" : [180, -90]}})
 t.insert({geo: { "type" : "Point", "coordinates" : [180, 90]}})
 t.insert({geo: { "type" : "Point", "coordinates" : [-180, 90]}})
 res = t.find({ "geo" : { "$near" : { "$geometry" : origin } } }).limit(10000)
-resNear = db.runCommand({geoNear : t.getName(), near: [0,0], num: 10000})
+resNear = db.runCommand({geoNear : t.getName(), near: [0,0], num: 10000, spherical: true})
 assert.eq(res.itcount(), resNear.results.length, (2 * points) * (2 * points) + 4)
+
+function testRadAndDegreesOK(distance) {
+    // Distance for old style points is radians.
+    resRadians = t.find({geo: {$nearSphere: [0,0], $maxDistance: (distance / (6378.1 * 1000))}})
+    // Distance for new style points is meters.
+    resMeters = t.find({ "geo" : { "$near" : { "$geometry" : origin, $maxDistance: distance} } })
+    // And we should get the same # of results no matter what.
+    assert.eq(resRadians.itcount(), resMeters.itcount())
+
+    // Also, geoNear should behave the same way.
+    resGNMeters = db.runCommand({geoNear : t.getName(), near: origin, maxDistance: distance, spherical: true})
+    resGNRadians = db.runCommand({geoNear : t.getName(), near: [0,0], maxDistance: (distance / (6378.1 * 1000)), spherical: true})
+    assert.eq(resGNRadians.results.length, resGNMeters.results.length)
+    for (var i = 0; i < resGNRadians.length; ++i) {
+        // Radius of earth * radians = distance in meters.
+        assert.close(resGNRadians.results[i].dis * 6378.1 * 1000, resGNMeters.results[i].dis)
+    }
+}
+
+testRadAndDegreesOK(1);
+testRadAndDegreesOK(10)
+testRadAndDegreesOK(50)
+testRadAndDegreesOK(10000)

@@ -176,10 +176,14 @@ printShardingStatus(config, true);
 
 jsTest.log("Upgrading config db from v3 to v4...");
 
+// Just stop the balancer, but don't wait for it to stop, to simulate race conds
+st.setBalancer(false);
+printjson(config.settings.find().toArray());
+
 var startTime = new Date();
 
 // Make sure up
-var mongosNew = MongoRunner.runMongos({ binVersion : "latest", configdb : configConnStr, upgrade : "" })
+var mongosNew = MongoRunner.runMongos({ binVersion : "2.4", configdb : configConnStr, upgrade : "" })
 assert.neq(null, mongosNew);
 MongoRunner.stopMongos(mongosNew);
 
@@ -259,7 +263,7 @@ var checkUpgraded = function() {
     assert.eq(version.minCompatibleVersion, 3);
     assert.eq(version.currentVersion, 4);
     assert(version.clusterId);
-    assert.eq(version.excluding.length, 0);
+    assert.eq(version.excluding, undefined);
 }
 
 checkUpgraded();

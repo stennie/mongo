@@ -25,6 +25,7 @@
 
 #include <time.h>
 
+#include "mongo/base/counter.h"
 #include "mongo/base/init.h"
 #include "mongo/base/status.h"
 #include "mongo/bson/util/builder.h"
@@ -35,6 +36,7 @@
 #include "mongo/db/background.h"
 #include "mongo/db/btreecursor.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/server_status.h"
 #include "mongo/db/db.h"
 #include "mongo/db/dur_stats.h"
 #include "mongo/db/index_update.h"
@@ -50,6 +52,7 @@
 #include "mongo/db/repl.h"
 #include "mongo/db/repl_block.h"
 #include "mongo/db/replutil.h"
+#include "mongo/db/stats/timer_stats.h"
 #include "mongo/s/d_writeback.h"
 #include "mongo/s/stale_exception.h"  // for SendStaleConfigException
 #include "mongo/scripting/engine.h"
@@ -97,6 +100,12 @@ namespace mongo {
        note: once non-null, never goes to null again.
     */
     BSONObj *getLastErrorDefault = 0;
+
+    static TimerStats gleWtimeStats;
+    static ServerStatusMetricField<TimerStats> displayGleLatency( "getLastError.wtime", &gleWtimeStats );
+
+    static Counter64 gleWtimeouts;
+    static ServerStatusMetricField<Counter64> gleWtimeoutsDisplay( "getLastError.wtimeouts", &gleWtimeouts );
 
     class CmdGetLastError : public Command {
     public:
@@ -185,7 +194,7 @@ namespace mongo {
                 }
 
                 int timeout = cmdObj["wtimeout"].numberInt();
-                Timer t;
+                TimerHolder timer( &gleWtimeStats );
 
                 long long passes = 0;
                 char buf[32];
@@ -232,11 +241,12 @@ namespace mongo {
                     }
 
 
-                    if ( timeout > 0 && t.millis() >= timeout ) {
+                    if ( timeout > 0 && timer.millis() >= timeout ) {
+                        gleWtimeouts.increment();
                         result.append( "wtimeout" , true );
                         errmsg = "timed out waiting for slaves";
-                        result.append( "waited" , t.millis() );
-                        result.append("replicatedTo", getHostsReplicatedTo(op));
+                        result.append( "waited" , timer.millis() );
+                        result.append("writtenTo", getHostsWrittenTo(op));
                         result.append( "err" , "timeout" );
                         return true;
                     }
@@ -247,13 +257,15 @@ namespace mongo {
                     killCurrentOp.checkForInterrupt();
                 }
 
-                result.append("replicatedTo", getHostsReplicatedTo(op));
-                result.appendNumber( "wtime" , t.millis() );
+                result.append("writtenTo", getHostsWrittenTo(op));
+                int myMillis = timer.recordMillis();
+                result.appendNumber( "wtime" , myMillis );
             }
 
             result.appendNull( "err" );
             return true;
         }
+
     } cmdGetLastError;
 
     class CmdGetPrevError : public Command {
@@ -1219,12 +1231,12 @@ namespace mongo {
             if ( jsobj["scale"].isNumber() ) {
                 scale = jsobj["scale"].numberInt();
                 if ( scale <= 0 ) {
-                    errmsg = "scale has to be > 0";
+                    errmsg = "scale has to be >= 1";
                     return false;
                 }
             }
             else if ( jsobj["scale"].trueValue() ) {
-                errmsg = "scale has to be a number > 0";
+                errmsg = "scale has to be a number >= 1";
                 return false;
             }
 
@@ -1474,7 +1486,11 @@ namespace mongo {
             ActionSet targetActions;
             targetActions.addAction(ActionType::insert);
             targetActions.addAction(ActionType::ensureIndex);
-            std::string targetNs = dbname + "." + cmdObj.getStringField("toCollection");
+            std::string collection = cmdObj.getStringField("toCollection");
+            uassert(16708, "bad 'toCollection' value", !collection.empty());
+
+            std::string targetNs = dbname + "." + collection;
+
             out->push_back(Privilege(targetNs, targetActions));
         }
         bool run(const string& dbname, BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
@@ -2059,7 +2075,7 @@ namespace mongo {
 
         // Treat the command the same as if it has slaveOk bit on if it has a read
         // preference setting. This is to allow these commands to run on a secondary.
-        if (hasReadPreference(_cmdobj)) {
+        if (Query::hasReadPreference(_cmdobj)) {
             queryOptions |= QueryOption_SlaveOk;
         }
 

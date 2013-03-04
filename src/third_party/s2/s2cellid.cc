@@ -27,6 +27,8 @@ using std::vector;
 #include "util/math/mathutil.h"
 #include "util/math/vector2-inl.h"
 
+#include "mongo/base/init.h"
+
 // The following lookup tables are used to convert efficiently between an
 // (i,j) cell index and the corresponding position along the Hilbert curve.
 // "lookup_pos" maps 4 bits of "i", 4 bits of "j", and 2 bits representing the
@@ -86,24 +88,17 @@ static void InitLookupCell(int level, int i, int j, int orig_orientation,
   }
 }
 
-static int Init() {
+static void Init() {
   InitLookupCell(0, 0, 0, 0, 0, 0);
   InitLookupCell(0, 0, 0, kSwapMask, 0, kSwapMask);
   InitLookupCell(0, 0, 0, kInvertMask, 0, kInvertMask);
   InitLookupCell(0, 0, 0, kSwapMask|kInvertMask, 0, kSwapMask|kInvertMask);
-  return 5;
 }
 
-#ifndef _WIN32
-static pthread_once_t init_once = PTHREAD_ONCE_INIT;
-static void voidInit() { (void)Init(); }
-inline static void MaybeInit() {
-  pthread_once(&init_once, voidInit);
+MONGO_INITIALIZER(S2CellIdInit)(mongo::InitializerContext *context) {
+    Init();
+    return mongo::Status::OK();
 }
-#else
-static const int foo = Init();
-inline static void MaybeInit() {}
-#endif
 
 int S2CellId::level() const {
   // Fast path for leaf cells.
@@ -216,9 +211,6 @@ inline int S2CellId::STtoIJ(double s) {
 
 
 S2CellId S2CellId::FromFaceIJ(int face, int i, int j) {
-  // Initialization if not done yet
-  MaybeInit();
-
   // Optimization notes:
   //  - Non-overlapping bit fields can be combined with either "+" or "|".
   //    Generally "+" seems to produce better code, but not always.
@@ -278,9 +270,6 @@ S2CellId S2CellId::FromLatLng(S2LatLng const& ll) {
 }
 
 int S2CellId::ToFaceIJOrientation(int* pi, int* pj, int* orientation) const {
-  // Initialization if not done yet
-  MaybeInit();
-
   int i = 0, j = 0;
   int face = this->face();
   int bits = (face & kSwapMask);
@@ -519,7 +508,41 @@ void S2CellId::AppendAllNeighbors(int nbr_level,
   }
 }
 
+inline char intToChar(int i) {
+    return '0' + i;
+}
+
+inline uint64 charToInt(char c) {
+    return static_cast<uint64>(c - '0');
+}
+
+
+S2CellId S2CellId::FromString(const string& str) {
+    int face = charToInt(str[0]);
+    int level = str.length() - 2;
+    uint64 pos = 0;
+    for (size_t i = 2; i < str.length(); ++i) {
+        pos |= charToInt(str[i]) << (2 * (kMaxLevel - (i - 1)) + 1);
+    }
+    pos |= (uint64)1 << (2 * (kMaxLevel - level));
+    return FromFacePosLevel(face, pos, level);
+}
+
 string S2CellId::ToString() const {
+  if (!is_valid()) {
+    return StringPrintf("Invalid: %016llx", id());
+  }
+  string out;
+  out.reserve(2 + level());
+  out.push_back(intToChar(face()));
+  out.push_back('f');
+  for (int current_level = 1; current_level <= level(); ++current_level) {
+    out.push_back(intToChar(child_position(current_level)));
+  }
+  return out;
+}
+
+string S2CellId::slowToString() const {
   if (!is_valid()) {
     return StringPrintf("Invalid: %016llx", id());
   }

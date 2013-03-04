@@ -25,6 +25,7 @@
 
 #include "mongo/base/initializer.h"
 #include "mongo/client/dbclientinterface.h"
+#include "mongo/client/sasl_client_authenticate.h"
 #include "mongo/db/cmdline.h"
 #include "mongo/db/repl/rs_member.h"
 #include "mongo/scripting/engine.h"
@@ -41,6 +42,7 @@
 #ifdef _WIN32
 #include <io.h>
 #define isatty _isatty
+#define fileno _fileno
 #else
 #include <unistd.h>
 #endif
@@ -158,11 +160,6 @@ void quitNicely( int sig ) {
         return;
     }
 
-#if !defined(_WIN32)
-    if ( sig == SIGPIPE )
-        mongo::rawOut( "mongo got signal SIGPIPE\n" );
-#endif
-
     killOps();
     shellHistoryDone();
     ::_exit(0);
@@ -231,6 +228,8 @@ void myterminate() {
     ::_exit( 14 );
 }
 
+static void ignoreSignal(int ignored) {}
+
 void setupSignals() {
     signal( SIGINT , quitNicely );
     signal( SIGTERM , quitNicely );
@@ -239,7 +238,12 @@ void setupSignals() {
     signal( SIGFPE , quitAbruptly );
 
 #if !defined(_WIN32) // surprisingly these are the only ones that don't work on windows
-    signal( SIGPIPE , quitNicely ); // Maybe just log and continue?
+    struct sigaction sigactionSignals;
+    sigactionSignals.sa_handler = ignoreSignal;
+    sigemptyset(&sigactionSignals.sa_mask);
+    sigactionSignals.sa_flags = 0;
+    sigaction(SIGPIPE, &sigactionSignals, NULL); // errors are handled in socket code directly
+
     signal( SIGBUS , quitAbruptly );
 #endif
 
@@ -619,6 +623,7 @@ int _main( int argc, char* argv[], char **envp ) {
     string username;
     string password;
     string authenticationMechanism;
+    string authenticationDatabase;
 
     std::string sslPEMKeyFile;
     std::string sslPEMKeyPassword;
@@ -645,8 +650,11 @@ int _main( int argc, char* argv[], char **envp ) {
     ( "eval", po::value<string>( &script ), "evaluate javascript" )
     ( "username,u", po::value<string>(&username), "username for authentication" )
     ( "password,p", new mongo::PasswordValue( &password ), "password for authentication" )
+    ("authenticationDatabase",
+     po::value<string>(&authenticationDatabase)->default_value(""),
+     "user source (defaults to dbname)" )
     ("authenticationMechanism",
-     po::value<string>(&authenticationMechanism)->default_value("MONGO-CR"),
+     po::value<string>(&authenticationMechanism)->default_value("MONGODB-CR"),
      "authentication mechanism")
     ( "help,h", "show this usage information" )
     ( "version", "show version information" )
@@ -822,8 +830,16 @@ int _main( int argc, char* argv[], char **envp ) {
         if ( username.size() ) {
             authStringStream << "var username = \"" << username << "\";" << endl;
             authStringStream << "var password = \"" << password << "\";" << endl;
-            authStringStream << "if (!db.auth(username, password)) { throw 'login failed'; }"
-                             << endl;
+            if (authenticationDatabase.empty()) {
+                authStringStream << "var authDb = db;" << endl;
+            }
+            else {
+                authStringStream << "var authDb = db.getSiblingDB(\"" << authenticationDatabase <<
+                    "\");" << endl;
+            }
+            authStringStream << "authDb._authOrThrow({ " <<
+                saslCommandPrincipalFieldName << ": username, " <<
+                saslCommandPasswordFieldName << ": password });" << endl;
         }
         authStringStream << "}())";
 
@@ -882,7 +898,7 @@ int _main( int argc, char* argv[], char **envp ) {
             }
         }
 
-        if ( !hasMongoRC && isatty(0) ) {
+        if ( !hasMongoRC && isatty(fileno(stdin)) ) {
            cout << "Welcome to the MongoDB shell.\n"
                    "For interactive help, type \"help\".\n"
                    "For more comprehensive documentation, see\n\thttp://docs.mongodb.org/\n"
@@ -892,7 +908,7 @@ int _main( int argc, char* argv[], char **envp ) {
            f.close();
         }
 
-        if ( !nodb ) {
+        if ( !nodb && !mongo::cmdLine.quiet && isatty(fileno(stdin)) ) {
             scope->exec( "shellHelper( 'show', 'startupWarnings' )", "(shellwarnings", false, true, false );
         }
 
@@ -1031,17 +1047,18 @@ int wmain( int argc, wchar_t* argvW[] ) {
     UINT initialConsoleOutputCodePage = GetConsoleOutputCP();
     SetConsoleCP( CP_UTF8 );
     SetConsoleOutputCP( CP_UTF8 );
-    int returnValue = -1;
+    int returnCode;
     try {
         WindowsCommandLine wcl( argc, argvW );
-        returnValue = _main( argc, wcl.argv(), NULL );  // TODO: Convert wide env to utf8 env.
+        returnCode = _main( argc, wcl.argv(), NULL );  // TODO: Convert wide env to utf8 env.
     }
     catch ( mongo::DBException& e ) {
         cerr << "exception: " << e.what() << endl;
+        returnCode = 1;
     }
     SetConsoleCP( initialConsoleInputCodePage );
     SetConsoleOutputCP( initialConsoleOutputCodePage );
-    ::_exit(returnValue);
+    ::_exit(returnCode);
 }
 #else // #ifdef _WIN32
 int main( int argc, char* argv[], char **envp ) {

@@ -2,17 +2,17 @@
 
 /*    Copyright 2009 10gen Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include "mongo/pch.h"
@@ -24,10 +24,12 @@
 
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/client/dbclientinterface.h"
+#include "mongo/scripting/bench.h"
 #include "mongo/util/file.h"
 
 namespace mongo {
     long long Scope::_lastVersion = 1;
+    static const unsigned kMaxJsFileLength = std::numeric_limits<unsigned>::max() - 1;
 
     ScriptEngine::ScriptEngine() : _scopeInitCallback() {
     }
@@ -37,7 +39,8 @@ namespace mongo {
 
     Scope::Scope() : _localDBName(""),
                      _loadedVersion(0),
-                     _numTimeUsed(0) {
+                     _numTimeUsed(0),
+                     _lastRetIsNativeCode(false) {
     }
 
     Scope::~Scope() {
@@ -180,9 +183,15 @@ namespace mongo {
             uassert(10209, str::stream() << "name has to be a string: " << n, n.type() == String);
             uassert(10210, "value has to be set", v.type() != EOO);
 
-            setElement(n.valuestr(), v);
-            thisTime.insert(n.valuestr());
-            _storedNames.insert(n.valuestr());
+            try {
+                setElement(n.valuestr(), v);
+                thisTime.insert(n.valuestr());
+                _storedNames.insert(n.valuestr());
+            }
+            catch (const DBException& setElemEx) {
+                log() << "unable to load stored JavaScript function " << n.valuestr()
+                      << "(): " << setElemEx.what() << endl;
+            }
         }
 
         // remove things from scope that were removed from the system.js collection
@@ -213,8 +222,12 @@ namespace mongo {
         map<string, ScriptingFunction>::iterator i = _cachedFunctions.find(code);
         if (i != _cachedFunctions.end())
             return i->second;
-        ScriptingFunction f = _createFunction(code);
-        _cachedFunctions[code] = f;
+        // NB: we calculate the function number for v8 so the cache can be utilized to
+        //     lookup the source on an exception, but SpiderMonkey uses the value
+        //     returned by JS_CompileFunction.
+        ScriptingFunction functionNumber = getFunctionCache().size() + 1;
+        _cachedFunctions[code] = functionNumber;
+        ScriptingFunction f = _createFunction(code, functionNumber);
         return f;
     }
 
@@ -229,7 +242,6 @@ namespace mongo {
     }
 
     void Scope::execCoreFiles() {
-        // keeping same order as in SConstruct
         execSetup(JSFiles::utils);
         execSetup(JSFiles::utils_sh);
         execSetup(JSFiles::db);
@@ -237,6 +249,14 @@ namespace mongo {
         execSetup(JSFiles::mr);
         execSetup(JSFiles::query);
         execSetup(JSFiles::collection);
+    }
+
+    /** install BenchRunner suite */
+    void Scope::installBenchRun() {
+        injectNative("benchRun", BenchRunner::benchRunSync);
+        injectNative("benchRunSync", BenchRunner::benchRunSync);
+        injectNative("benchStart", BenchRunner::benchStart);
+        injectNative("benchFinish", BenchRunner::benchFinish);
     }
 
     typedef map<string, list<Scope*> > PoolToScopes;
@@ -258,7 +278,7 @@ namespace mongo {
             bool oom = s->hasOutOfMemoryException();
 
             // do not keep too many contexts, or use them for too long
-            if (l.size() > 10 || s->getTimeUsed() > 10 || oom) {
+            if (l.size() > 10 || s->getTimeUsed() > 10 || oom || !s->getError().empty()) {
                 delete s;
             }
             else {
@@ -329,6 +349,8 @@ namespace mongo {
         void reset() { _real->reset(); }
         void init(const BSONObj* data) { _real->init(data); }
         void localConnect(const char* dbName) { _real->localConnect(dbName); }
+        void setLocalDB(const string& dbName) { _real->setLocalDB(dbName); }
+        void loadStored(bool ignoreNotConnected = false) { _real->loadStored(ignoreNotConnected); }
         void externalSetup() { _real->externalSetup(); }
         void gc() { _real->gc(); }
         bool isKillPending() const { return _real->isKillPending(); }
@@ -348,10 +370,11 @@ namespace mongo {
         void setObject(const char* field, const BSONObj& obj, bool readOnly = true) {
             _real->setObject(field, obj, readOnly);
         }
+        bool isLastRetNativeCode() { return _real->isLastRetNativeCode(); }
+
         void setBoolean(const char* field, bool val) { _real->setBoolean(field, val); }
         void setFunction(const char* field, const char* code) { _real->setFunction(field, code); }
         ScriptingFunction createFunction(const char* code) { return _real->createFunction(code); }
-        ScriptingFunction _createFunction(const char* code) { return _real->createFunction(code); }
         int invoke(ScriptingFunction func, const BSONObj* args, const BSONObj* recv,
                    int timeoutMs, bool ignoreReturn, bool readOnlyArgs, bool readOnlyRecv) {
             return _real->invoke(func, args, recv, timeoutMs, ignoreReturn,
@@ -372,21 +395,31 @@ namespace mongo {
             _real->append(builder, fieldName, scopeName);
         }
 
+    protected:
+        FunctionCacheMap& getFunctionCache() { return _real->getFunctionCache(); }
+
+        ScriptingFunction _createFunction(const char* code, ScriptingFunction functionNumber = 0) {
+            return _real->_createFunction(code, functionNumber);
+        }
+
     private:
         string _pool;
         Scope* _real;
     };
 
-    auto_ptr<Scope> ScriptEngine::getPooledScope(const string& pool) {
+    /** Get a scope from the pool of scopes matching the supplied pool name */
+    auto_ptr<Scope> ScriptEngine::getPooledScope(const string& pool, const string& scopeType) {
         if (!scopeCache.get())
             scopeCache.reset(new ScopeCache());
 
-        Scope* s = scopeCache->get(pool);
+        Scope* s = scopeCache->get(pool + scopeType);
         if (!s)
             s = newScope();
 
         auto_ptr<Scope> p;
-        p.reset(new PooledScope(pool, s));
+        p.reset(new PooledScope(pool + scopeType, s));
+        p->setLocalDB(pool);
+        p->loadStored(true);
         return p;
     }
 

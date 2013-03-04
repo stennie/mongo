@@ -64,17 +64,8 @@ namespace mongo {
             _func = 0;
             _initCalled = false;
         }
-        
-        ~Where() {
 
-            if ( _scope.get() ){
-                try {
-                    _scope->execSetup( "_mongo.readOnly = false;" , "make not read only" );
-                }
-                catch( DBException& e ){
-                    warning() << "javascript scope cleanup interrupted" << causedBy( e ) << endl;
-                }
-            }
+        ~Where() {
             _func = 0;
         }
 
@@ -83,14 +74,12 @@ namespace mongo {
                 return;
             _initCalled = true;
 
-            _scope = globalScriptEngine->getPooledScope( _ns );
             NamespaceString ns( _ns );
-            _scope->localConnect( ns.db.c_str() );
-            
+            _scope = globalScriptEngine->getPooledScope( ns.db.c_str(), "where" );
+
             massert( 10341 ,  "code has to be set first!" , ! _jsCode.empty() );
 
             _func = _scope->createFunction( _jsCode.c_str() );
-            _scope->execSetup( "_mongo.readOnly = true;" , "make read only" );
         }
 
         void setScope( const BSONObj& scope ) {
@@ -123,7 +112,7 @@ namespace mongo {
                 uassert( 10072 , "unknown error in invocation of $where function", false);
             }
             
-            return _scope->getBoolean( "return" ) != 0;
+            return _scope->getBoolean( "__returnValue" ) != 0;
         }
         
     private:
@@ -369,35 +358,21 @@ namespace mongo {
             flags = fe.valuestrsafe();
             break;
         }
+        case BSONObj::opGEO_INTERSECTS:
         case BSONObj::opWITHIN: {
-            BSONObj shapeObj = fe.embeddedObject();
-            BSONObjIterator argIt(shapeObj);
-            uassert(16515, "Empty obj for $within: " + shapeObj.toString(), argIt.more());
-
-            BSONElement elt = argIt.next();
-            uassert(16516, "Within must be provided a BSONObj: " + elt.toString(),
-                    elt.isABSONObj());
-            BSONObj obj = elt.Obj();
-
-            if (str::equals(elt.fieldName(), "$box")) {
-                uassert(16615, "Malformed $box: " + obj.toString(), GeoParser::isLegacyBox(obj));
-                _geo.push_back(GeoMatcher::makeBoxMatcher(e.fieldName(), obj, isNot));
-            } else if (str::equals(elt.fieldName(), "$center")) {
-                uassert(16616, "Malformed $center: " + obj.toString(),
-                        GeoParser::isLegacyCenter(obj));
-                _geo.push_back(GeoMatcher::makeCircleMatcher(e.fieldName(), obj, isNot));
-            } else if (str::equals(elt.fieldName(), "$polygon")) {
-                uassert(16617, "Malformed $polygon: " + obj.toString(),
-                        GeoParser::isLegacyPolygon(obj));
-                _geo.push_back(GeoMatcher::makePolygonMatcher(e.fieldName(), obj, isNot));
-            } else {
-                uasserted(16529, "Couldn't pull any geometry out of $within query: "
-                                 + obj.toString());
+            uassert(16516, "Within must be provided a BSONObj", e.isABSONObj());
+            BSONObj queryObj = e.Obj();
+            if (isNot) {
+                // Get to the $within/$geoIntersects hiding inside the $not.
+                queryObj = queryObj.firstElement().embeddedObject();
             }
+            GeoQuery query(e.fieldName());
+            uassert(16677, "Malformed geo query: " + queryObj.toString(),
+                    query.parseFrom(queryObj));
+            _geo.push_back(GeoMatcher(query, isNot));
             break;
         }
         case BSONObj::opNEAR:
-        case BSONObj::opGEO_INTERSECTS:
         case BSONObj::opMAX_DISTANCE:
             break;
         default:
@@ -972,13 +947,22 @@ namespace mongo {
         for (vector<GeoMatcher>::const_iterator it = _geo.begin(); it != _geo.end(); ++it) {
             verify(_constrainIndexKey.isEmpty());
             BSONElementSet s;
-            jsobj.getFieldsDotted(it->getFieldName().c_str(), s, false);
+            jsobj.getFieldsDotted(it->getField().c_str(), s, false);
             int matches = 0;
             for (BSONElementSet::const_iterator i = s.begin(); i != s.end(); ++i) {
-                if (!i->isABSONObj()) { continue; }
-                Point p;
-                if (!GeoMatcher::pointFrom(i->Obj(), &p)) { continue; }
-                if (it->containsPoint(p)) { ++matches; break; }
+                if (!i->isABSONObj()) { return false; }
+                GeometryContainer container;
+                if (container.parseFrom(i->Obj()) && it->matches(container)) {
+                    ++matches; break;
+                }
+                // Maybe it's an array of geometries.
+                BSONObjIterator geoIt(i->Obj());
+                while (geoIt.more()) {
+                    BSONElement e = geoIt.next();
+                    if (!e.isABSONObj()) { return false; }
+                    if (!container.parseFrom(e.embeddedObject())) { return false; }
+                    if (it->matches(container)) { ++matches; break; }
+                }
             }
             if (0 == matches) { return false; }
         }
@@ -1182,7 +1166,7 @@ namespace mongo {
                 u_assert( 10072 , "unknown error in invocation of $where function", false);
                 return false;
             }
-            return _where->scope->getBoolean( "return" ) != 0;
+            return _where->scope->getBoolean( "__returnValue" ) != 0;
 
         }
     }

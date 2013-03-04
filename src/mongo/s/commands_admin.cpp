@@ -29,6 +29,7 @@
 #include "mongo/s/chunk.h"
 #include "mongo/s/client_info.h"
 #include "mongo/s/config.h"
+#include "mongo/s/field_parser.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/strategy.h"
 #include "mongo/s/type_chunk.h"
@@ -668,9 +669,6 @@ namespace mongo {
                     // we need to move them around to balance.
                     ChunkManagerPtr chunkManager = config->getChunkManager( ns , true );
                     ChunkMap chunkMap = chunkManager->getChunkMap();
-                    if ( chunkMap.size() == 1 )
-                        return true;
-
                     // 2. Move and commit each "big chunk" to a different shard.
                     int i = 0;
                     for ( ChunkMap::const_iterator c = chunkMap.begin(); c != chunkMap.end(); ++c,++i ){
@@ -688,6 +686,10 @@ namespace mongo {
                                       << " while sharding collection " << ns << ". Reason: "
                                       <<  moveResult << endl;
                         }
+                    }
+
+                    if (allSplits.empty()) {
+                        return true;
                     }
 
                     // Reload the config info, after all the migrations
@@ -802,21 +804,81 @@ namespace mongo {
                     }
                 }
 
-                BSONObj find = cmdObj.getObjectField( "find" );
-                if ( find.isEmpty() ) {
-                    find = cmdObj.getObjectField( "middle" );
+                const BSONField<BSONObj> findField("find", BSONObj());
+                const BSONField<BSONArray> boundsField("bounds", BSONArray());
+                const BSONField<BSONObj> middleField("middle", BSONObj());
 
-                    if ( find.isEmpty() ) {
-                        errmsg = "need to specify find or middle";
+                BSONObj find;
+                if (FieldParser::extract(cmdObj, findField, &find, &errmsg) ==
+                        FieldParser::FIELD_INVALID) {
+                    return false;
+                }
+
+                BSONArray bounds;
+                if (FieldParser::extract(cmdObj, boundsField, &bounds, &errmsg) ==
+                        FieldParser::FIELD_INVALID) {
+                    return false;
+                }
+
+                if (!bounds.isEmpty()) {
+                    if (!bounds.hasField("0")) {
+                        errmsg = "lower bound not specified";
+                        return false;
+                    }
+
+                    if (!bounds.hasField("1")) {
+                        errmsg = "upper bound not specified";
                         return false;
                     }
                 }
 
-                ChunkManagerPtr info = config->getChunkManager( ns );
-                ChunkPtr chunk = info->findChunkForDoc( find );
-                BSONObj middle = cmdObj.getObjectField( "middle" );
+                if (!find.isEmpty() && !bounds.isEmpty()) {
+                    errmsg = "cannot specify bounds and find at the same time";
+                    return false;
+                }
 
-                verify( chunk.get() );
+                BSONObj middle;
+                if (FieldParser::extract(cmdObj, middleField, &middle, &errmsg) ==
+                        FieldParser::FIELD_INVALID) {
+                    return false;
+                }
+
+                if (find.isEmpty() && bounds.isEmpty() && middle.isEmpty()) {
+                    errmsg = "need to specify find/bounds or middle";
+                    return false;
+                }
+
+                if (!find.isEmpty() && !middle.isEmpty()) {
+                    errmsg = "cannot specify find and middle together";
+                    return false;
+                }
+
+                if (!bounds.isEmpty() && !middle.isEmpty()) {
+                    errmsg = "cannot specify bounds and middle together";
+                    return false;
+                }
+
+                ChunkManagerPtr info = config->getChunkManager( ns );
+                ChunkPtr chunk;
+
+                if (!find.isEmpty()) {
+                    chunk = info->findChunkForDoc(find);
+                }
+                else if (!bounds.isEmpty()) {
+                    chunk = info->findIntersectingChunk(bounds[0].Obj());
+                    verify(chunk.get());
+
+                    if (chunk->getMin() != bounds[0].Obj() ||
+                        chunk->getMax() != bounds[1].Obj()) {
+                        errmsg = "no chunk found from the given upper and lower bounds";
+                        return false;
+                    }
+                }
+                else { // middle
+                    chunk = info->findIntersectingChunk(middle);
+                }
+
+                verify(chunk.get());
                 log() << "splitting: " << ns << "  shard: " << chunk << endl;
 
                 BSONObj res;
@@ -1420,6 +1482,11 @@ namespace mongo {
                     continue;
                 }
 
+                if ( name == "config" || name == "admin" ) {
+                    //always get this from the config servers
+                    continue;
+                }
+
                 long long size = i->second;
                 totalSize += size;
 
@@ -1432,7 +1499,7 @@ namespace mongo {
                 bb.append( temp.obj() );
             }
             
-            if ( sizes.find( "config" ) == sizes.end() ){
+            { // get config db from the config servers (first one)
                 scoped_ptr<ScopedDbConnection> conn(
                         ScopedDbConnection::getInternalScopedDbConnection(
                                 configServer.getPrimary().getConnString(), 30));
@@ -1449,6 +1516,27 @@ namespace mongo {
                 }
                 else {
                     bb.append( BSON( "name" << "config" ) );
+                }
+                conn->done();
+            }
+
+            { // get admin db from the config servers (first one)
+                scoped_ptr<ScopedDbConnection> conn(
+                        ScopedDbConnection::getInternalScopedDbConnection(
+                                configServer.getPrimary().getConnString(), 30));
+                BSONObj x;
+                if ( conn->get()->simpleCommand( "admin" , &x , "dbstats" ) ){
+                    BSONObjBuilder b;
+                    b.append( "name" , "admin" );
+                    b.appendBool( "empty" , false );
+                    if ( x["fileSize"].type() )
+                        b.appendAs( x["fileSize"] , "sizeOnDisk" );
+                    else
+                        b.append( "sizeOnDisk" , 1 );
+                    bb.append( b.obj() );
+                }
+                else {
+                    bb.append( BSON( "name" << "admin" ) );
                 }
                 conn->done();
             }

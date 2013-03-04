@@ -53,23 +53,26 @@ namespace mongo {
 
                 MongosType ping;
                 string errMsg;
-                if (!ping.parseBSON(pingDoc, &errMsg) || !ping.isValid(&errMsg)) {
+                // NOTE: We don't care if the ping is invalid, legacy stuff will be
+                if (!ping.parseBSON(pingDoc, &errMsg)) {
                     warning() << "could not parse ping document: " << pingDoc << causedBy(errMsg)
                               << endl;
+                    continue;
                 }
 
                 string mongoVersion = "2.0";
                 // Hack to determine older mongos versions from ping format
-                if (!pingDoc[MongosType::waiting()].eoo()) mongoVersion = "2.2";
-                if (ping.getMongoVersion() != "") {
+                if (ping.isWaitingSet()) mongoVersion = "2.2";
+                if (ping.isMongoVersionSet() && ping.getMongoVersion() != "") {
                     mongoVersion = ping.getMongoVersion();
                 }
 
                 Date_t lastPing = ping.getPing();
 
                 long long quietIntervalMillis = 0;
-                if ((jsTime() - lastPing) >= 0) {
-                    quietIntervalMillis = static_cast<long long>(jsTime() - lastPing);
+                Date_t currentJsTime = jsTime();
+                if (currentJsTime >= lastPing) {
+                    quietIntervalMillis = static_cast<long long>(currentJsTime - lastPing);
                 }
                 long long quietIntervalMins = quietIntervalMillis / (60 * 1000);
 
@@ -78,7 +81,7 @@ namespace mongo {
                     log() << "stale mongos detected " << quietIntervalMins << " minutes ago,"
                           << " network location is " << pingDoc["_id"].String()
                           << ", not checking version" << endl;
-	}
+            	}
                 else {
                     if (versionCmp(mongoVersion, minMongoVersion) < 0) {
                         return Status(ErrorCodes::RemoteValidationError,
@@ -120,7 +123,15 @@ namespace mongo {
                                            << " read from the config server" << causedBy(errMsg));
                 }
 
-                shardLocs.push_back(ConnectionString(shard.getHost()));
+                ConnectionString shardLoc = ConnectionString::parse(shard.getHost(), errMsg);
+                if (shardLoc.type() == ConnectionString::INVALID) {
+                    connPtr->done();
+                    return Status(ErrorCodes::UnsupportedFormat,
+                                  stream() << "invalid shard host " << shard.getHost()
+                                           << " read from the config server" << causedBy(errMsg));
+                }
+
+                shardLocs.push_back(shardLoc);
             }
         }
         catch (const DBException& e) {
@@ -143,7 +154,11 @@ namespace mongo {
             for (vector<HostAndPort>::iterator serverIt = servers.begin();
                     serverIt != servers.end(); ++serverIt)
             {
-                ConnectionString serverLoc(serverIt->toString(true));
+                // Note: This will *always* be a single-host connection
+                ConnectionString serverLoc(*serverIt);
+
+                log() << "checking that version of host " << serverLoc << " is compatible with " 
+                      << minMongoVersion << endl;
 
                 scoped_ptr<ScopedDbConnection> serverConnPtr;
 
@@ -207,12 +222,13 @@ namespace mongo {
 
                 BSONObj collDoc = cursor->nextSafe();
 
-                CollectionType* coll = new CollectionType();
+                // Replace with unique_ptr (also owned ptr map goes away)
+                auto_ptr<CollectionType> coll(new CollectionType());
                 string errMsg;
                 coll->parseBSON(collDoc, &errMsg);
 
                 // Needed for the v3 to v4 upgrade
-                bool epochNotSet = !coll->getEpoch().isSet();
+                bool epochNotSet = !coll->isEpochSet() || !coll->getEpoch().isSet();
                 if (optionalEpochs && epochNotSet) {
                     // Set our epoch to something here, just to allow
                     coll->setEpoch(OID::gen());
@@ -224,15 +240,17 @@ namespace mongo {
                                            << " read from the config server" << causedBy(errMsg));
                 }
 
-                if (coll->isDropped()) {
+                if (coll->isDroppedSet() && coll->getDropped()) {
                     continue;
                 }
 
                 if (optionalEpochs && epochNotSet) {
                     coll->setEpoch(OID());
                 }
-
-                collections->mutableMap().insert(make_pair(coll->getNS(), coll));
+    
+                // Get NS before releasing
+                string ns = coll->getNS();
+                collections->mutableMap().insert(make_pair(ns, coll.release()));
             }
         }
         catch (const DBException& e) {
@@ -272,7 +290,8 @@ namespace mongo {
 
                 BSONObj chunkDoc = cursor->nextSafe();
 
-                ChunkType* chunk = new ChunkType();
+                // TODO: replace with unique_ptr when available
+                auto_ptr<ChunkType> chunk(new ChunkType());
                 string errMsg;
                 if (!chunk->parseBSON(chunkDoc, &errMsg) || !chunk->isValid(&errMsg)) {
                     connPtr->done();
@@ -281,7 +300,7 @@ namespace mongo {
                                            << " read from the config server" << causedBy(errMsg));
                 }
 
-                chunks->mutableVector().push_back(chunk);
+                chunks->mutableVector().push_back(chunk.release());
             }
         }
         catch (const DBException& e) {

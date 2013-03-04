@@ -773,9 +773,11 @@ namespace mongo {
         vector<BSONObj> res;
         for ( unsigned i=0; i<_config.size(); i++ ) {
             BSONObj x;
+
+            scoped_ptr<ScopedDbConnection> conn;
+
             try {
-                scoped_ptr<ScopedDbConnection> conn(
-                        ScopedDbConnection::getInternalScopedDbConnection( _config[i], 30.0 ) );
+                conn.reset( ScopedDbConnection::getInternalScopedDbConnection( _config[i], 30.0 ) );
 
                 // check auth
                 conn->get()->update("config.foo.bar", BSONObj(), BSON("x" << 1));
@@ -796,6 +798,9 @@ namespace mongo {
                 conn->done();
             }
             catch ( const DBException& e ) {
+                if (conn) {
+                    conn->kill();
+                }
 
                 // We need to catch DBExceptions b/c sometimes we throw them
                 // instead of socket exceptions when findN fails
@@ -936,7 +941,9 @@ namespace mongo {
                         log() << "warning: invalid chunksize (" << csize << ") ignored" << endl;
                     } else {
                         LOG(1) << "MaxChunkSize: " << csize << endl;
-                        Chunk::MaxChunkSize = csize * 1024 * 1024;
+                        if ( !Chunk::setMaxChunkSizeSizeMB( csize ) ) {
+                            warning() << "invalid chunksize: " << csize << endl;
+                        }
                     }
                 }
                 else if ( name == "balancer" ) {

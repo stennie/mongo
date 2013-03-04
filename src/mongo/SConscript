@@ -12,12 +12,13 @@ Import("testEnv")
 Import("has_option")
 Import("usesm usev8")
 Import("installSetup")
+Import("enforce_glibc")
 Import("darwin windows solaris linux nix")
 
 env.SConscript(['base/SConscript',
                 'db/auth/SConscript',
                 'db/fts/SConscript',
-                'db/ops/SConscript',
+                'db/SConscript',
                 'platform/SConscript',
                 's/SConscript',
                 'unittest/SConscript'])
@@ -109,11 +110,19 @@ env.CppUnitTest('bson_validate_test', ['bson/bson_validate_test.cpp'],
 env.CppUnitTest('namespacestring_test', ['db/namespacestring_test.cpp'],
                 LIBDEPS=['bson'])
 
+env.CppUnitTest('index_set_test', ['db/index_set_test.cpp'],
+                LIBDEPS=['bson','index_set'])
+
+
 env.CppUnitTest('bson_extract_test', ['bson/util/bson_extract_test.cpp'], LIBDEPS=['bson'])
 
 env.CppUnitTest('descriptive_stats_test',
                 ['util/descriptive_stats_test.cpp'],
                 LIBDEPS=['foundation', 'bson']);
+
+env.CppUnitTest('sock_test', ['util/net/sock_test.cpp'],
+                LIBDEPS=['mongocommon', 'notmongodormongos'],
+                NO_CRUTCH=True)
 
 env.StaticLibrary( 'mongohasher', [ "db/hasher.cpp" ] )
 
@@ -152,6 +161,7 @@ commonFiles = [ "pch.cpp",
                 "client/dbclient_rs.cpp",
                 "client/dbclientcursor.cpp",
                 "client/model.cpp",
+                'client/sasl_client_authenticate.cpp',
                 "client/syncclusterconnection.cpp",
                 "db/dbmessage.cpp"
                 ]
@@ -159,7 +169,7 @@ commonFiles = [ "pch.cpp",
 commonSysLibdeps = []
 
 if env['MONGO_BUILD_SASL_CLIENT']:
-    commonFiles.extend(['client/sasl_client_authenticate.cpp',
+    commonFiles.extend(['client/sasl_client_authenticate_impl.cpp',
                         'util/gsasl_session.cpp'])
     commonSysLibdeps.append('gsasl')
 
@@ -262,12 +272,16 @@ env.StaticLibrary("coredb", [
         "db/projection.cpp",
         "db/querypattern.cpp",
         "db/queryutil.cpp",
+        "db/stats/timer_stats.cpp",
         "db/stats/top.cpp",
         "s/shardconnection.cpp",
         ],
                   LIBDEPS=['db/auth/serverauth',
+                           'db/common',
                            'server_parameters',
-                           'geoparser'])
+                           'geoparser',
+                           'geoquery',
+                           '$BUILD_DIR/mongo/foundation'])
 
 coreServerFiles = [ "db/client_basic.cpp",
                     "db/common.cpp",
@@ -300,7 +314,8 @@ if usesm:
 elif usev8:
     env.StaticLibrary('scripting', scripting_common_files + ['scripting/engine_v8.cpp',
                                                              'scripting/v8_db.cpp',
-                                                             'scripting/v8_utils.cpp',],
+                                                             'scripting/v8_utils.cpp',
+                                                             'scripting/v8_profiler.cpp'],
                        LIBDEPS=['bson_template_evaluator', '$BUILD_DIR/third_party/shim_v8'])
 else:
     env.StaticLibrary('scripting', scripting_common_files + ['scripting/engine_none.cpp'],
@@ -324,6 +339,8 @@ coreServerFiles.append( systemInfoPlatformFile )
 
 if has_option( "asio" ):
     coreServerFiles += [ "util/net/message_server_asio.cpp" ]
+
+env.StaticLibrary('index_set', [ 'db/index_set.cpp' ] )
 
 # mongod files - also files used in tools. present in dbtests, but not in mongos and not in client libs.
 serverOnlyFiles = [ "db/curop.cpp",
@@ -430,6 +447,8 @@ env.CppUnitTest('cmdline_test', 'db/cmdline_test.cpp', LIBDEPS=['dbcmdline'])
 
 env.CppUnitTest('diskloc_test', 'db/diskloc_test.cpp', LIBDEPS=[])
 
+env.CppUnitTest('v8_deadline_monitor_test', 'scripting/v8_deadline_monitor_test.cpp', LIBDEPS=[])
+
 env.Library('stacktrace', 'util/stacktrace.cpp')
 
 env.Program('lame_stacktrace_test', 'util/lame_stacktrace_test.cpp',
@@ -473,6 +492,18 @@ env.Library( "mongoscore",
 
 env.CppUnitTest( "balancer_policy_test" , [ "s/balancer_policy_tests.cpp" ] ,
                  LIBDEPS=["mongoscore", "coreshard", "mongocommon","coreserver","coredb","dbcmdline","mongodandmongos"] ,
+                 NO_CRUTCH=True)
+
+env.CppUnitTest("dbclient_rs_test", [ "client/dbclient_rs_test.cpp" ],
+                 LIBDEPS=[
+                    "coredb",
+                    "coreserver",
+                    "coreshard",
+                    "dbcmdline",
+                    "mocklib",
+                    "mongocommon",
+                    "mongodandmongos",
+                    "mongoscore"],
                  NO_CRUTCH=True)
 
 env.CppUnitTest("scoped_db_conn_test", [ "client/scoped_db_conn_test.cpp" ],
@@ -530,6 +561,10 @@ env.StaticLibrary("geoparser", [ "db/geo/geoparser.cpp", ],
                   LIBDEPS = [ "bson",
                               "geometry",
                               '$BUILD_DIR/third_party/s2/s2' ])
+env.StaticLibrary("geoquery", [ "db/geo/geoquery.cpp", ],
+                  LIBDEPS = [ "bson",
+                              "geometry",
+                              '$BUILD_DIR/third_party/s2/s2' ])
 
 env.CppUnitTest("hash_test", [ "db/geo/hash_test.cpp" ], LIBDEPS = ["geometry" ])
 env.CppUnitTest("geoparser_test", [ "db/geo/geoparser_test.cpp" ], LIBDEPS = ["geoparser"])
@@ -538,10 +573,12 @@ env.StaticLibrary("serveronly", serverOnlyFiles,
                   LIBDEPS=["coreshard",
                            "db/auth/authmongod",
                            "db/fts/ftsmongod",
-                           "db/ops/update",
+                           "db/common",
                            "dbcmdline",
                            "defaultversion",
                            "geoparser",
+                           "geoquery",
+                           "index_set",
                            '$BUILD_DIR/third_party/shim_snappy'])
 
 # These files go into mongos and mongod only, not into the shell or any tools.
@@ -672,12 +709,15 @@ if darwin or env["_HAVEPCAP"]:
 # --- shell ---
 
 # if you add a file here, you need to add it in scripting/engine.cpp and shell/createCPPfromJavaScriptFiles.js as well
-env.JSHeader( "shell/mongo.cpp" , 
-              [ "shell/utils.js","shell/utils_sh.js","shell/db.js","shell/mongo.js","shell/mr.js","shell/query.js","shell/collection.js"] )
+env.JSHeader("shell/mongo.cpp",
+             ["shell/assert.js", "shell/types.js", "shell/utils.js", "shell/utils_sh.js",
+              "shell/db.js", "shell/mongo.js", "shell/mr.js", "shell/query.js",
+              "shell/collection.js"])
 
 # if you add a file here, you need to add it in shell/shell_utils.cpp and shell/createCPPfromJavaScriptFiles.js as well
-env.JSHeader( "shell/mongo-server.cpp" ,
-              ["shell/servers.js", "shell/shardingtest.js", "shell/servers_misc.js", "shell/replsettest.js", "shell/replsetbridge.js"] )
+env.JSHeader("shell/mongo-server.cpp",
+             ["shell/servers.js", "shell/shardingtest.js",
+              "shell/servers_misc.js", "shell/replsettest.js", "shell/replsetbridge.js"])
 
 coreShellFiles = [ "shell/dbshell.cpp",
                    "shell/shell_utils.cpp",
@@ -703,11 +743,14 @@ if shellEnv is not None:
 
 def checkGlibc(target,source,env):
     import subprocess
+    import SCons.Errors
     stringProcess = subprocess.Popen( [ "strings", str( target[0] ) ], stdout=subprocess.PIPE )
     stringResult = stringProcess.communicate()[0]
     if stringResult.count( "GLIBC_2.4" ) > 0:
         print( "************* " + str( target[0] ) + " has GLIBC_2.4 dependencies!" )
-        Exit(-3)
+        raise SCons.Errors.BuildError(
+            node=target[0],
+            errstr="target has GLIBC_2.4 dependencies!")
 
 distBinaries = []
 
@@ -719,7 +762,7 @@ def installBinary( e, name ):
 
     name = add_exe( name )
 
-    if (not has_option( "no-glibc-check" ) and linux and "s3dist" in COMMAND_LINE_TARGETS):
+    if enforce_glibc:
         e.AddPostAction( name, checkGlibc )
 
     if (solaris or linux) and (not has_option("nostrip")):

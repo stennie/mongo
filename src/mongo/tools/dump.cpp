@@ -28,6 +28,7 @@
 #include "mongo/base/initializer.h"
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/db.h"
+#include "mongo/db/namespacestring.h"
 #include "mongo/tools/tool.h"
 
 using namespace mongo;
@@ -219,7 +220,7 @@ public:
               continue;
             }
 
-            if ( endsWith(name.c_str(), ".system.indexes") ) {
+            if (NamespaceString(name).coll == "system.indexes") {
               // Create system.indexes.bson for compatibility with pre 2.2 mongorestore
               const string filename = name.substr( db.size() + 1 );
               writeCollectionFile( name.c_str() , outdir / ( filename + ".bson" ) );
@@ -461,8 +462,6 @@ public:
                 }
             }
 
-            auth("local");
-
             BSONObj op = conn(true).findOne(opLogName, Query().sort("$natural", -1), 0, QueryOption_SlaveOk);
             if (op.isEmpty()) {
                 log() << "No operations in oplog. Please ensure you are connecting to a master." << endl;
@@ -477,7 +476,6 @@ public:
         string out = getParam("out");
         if ( out == "-" ) {
             if ( _db != "" && _coll != "" ) {
-                auth( _db );
                 writeCollectionStdout( _db+"."+_coll );
                 return 0;
             }
@@ -499,7 +497,6 @@ public:
             }
 
             log() << "all dbs" << endl;
-            auth( "admin" );
 
             BSONObj res = conn( true ).findOne( "admin.$cmd" , BSON( "listDatabases" << 1 ) );
             if ( ! res["databases"].isABSONObj() ) {
@@ -527,7 +524,6 @@ public:
             }
         }
         else {
-            auth( db );
             go( db , root / db );
         }
 

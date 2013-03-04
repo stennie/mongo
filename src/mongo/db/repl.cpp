@@ -56,6 +56,7 @@
 #include "mongo/db/instance.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/queryutil.h"
+#include "mongo/base/counter.h"
 
 namespace mongo {
 
@@ -157,7 +158,7 @@ namespace mongo {
         return replSettings.slave || replSettings.master || theReplSet;
     }
 
-    bool replAuthenticate(DBClientBase *conn);
+    bool replAuthenticate(DBClientBase *conn, bool skipAuthCheck);
 
     void appendReplicationInfo(BSONObjBuilder& result, int level) {
         if ( replSet ) {
@@ -220,7 +221,7 @@ namespace mongo {
                     scoped_ptr<ScopedDbConnection> conn( ScopedDbConnection::getInternalScopedDbConnection( s["host"].valuestr() ) );
                     
                     DBClientConnection *cliConn = dynamic_cast< DBClientConnection* >( &conn->conn() );
-                    if ( cliConn && replAuthenticate( cliConn ) ) {
+                    if ( cliConn && replAuthenticate(cliConn, false) ) {
                         BSONObj first = conn->get()->findOne( (string)"local.oplog.$" + sourcename,
                                                               Query().sort( BSON( "$natural" << 1 ) ) );
                         BSONObj last = conn->get()->findOne( (string)"local.oplog.$" + sourcename,
@@ -256,7 +257,6 @@ namespace mongo {
             return result.obj();
         }
     } replicationInfoServerStatus;
-
 
     class CmdIsMaster : public Command {
     public:
@@ -1122,11 +1122,18 @@ namespace mongo {
 
     BSONObj userReplQuery = fromjson("{\"user\":\"repl\"}");
 
-    bool replAuthenticate(DBClientBase *conn) {
+    /* Generally replAuthenticate will only be called within system threads to fully authenticate
+     * connections to other nodes in the cluster that will be used as part of internal operations.
+     * If a user-initiated action results in needing to call replAuthenticate, you can call it
+     * with skipAuthCheck set to false. Only do this if you are certain that the proper auth
+     * checks have already run to ensure that the user is authorized to do everything that this
+     * connection will be used for!
+     */
+    bool replAuthenticate(DBClientBase *conn, bool skipAuthCheck) {
         if( noauth ) {
             return true;
         }
-        if (!cc().getAuthorizationManager()->hasInternalAuthorization()) {
+        if (!skipAuthCheck && !cc().getAuthorizationManager()->hasInternalAuthorization()) {
             log() << "replauthenticate: requires internal authorization, failing" << endl;
             return false;
         }
@@ -1191,6 +1198,7 @@ namespace mongo {
         cmd.appendAs( me["_id"] , "handshake" );
         if (theReplSet) {
             cmd.append("member", theReplSet->selfId());
+            cmd.append("config", theReplSet->myConfig().asBson());
         }
 
         BSONObj res;
@@ -1200,6 +1208,13 @@ namespace mongo {
         return true;
     }
 
+    //number of readers created;
+    //  this happens when the source source changes, a reconfig/network-error or the cursor dies
+    static Counter64 readersCreatedStats;
+    static ServerStatusMetricField<Counter64> displayReadersCreated(
+                                                    "repl.network.readersCreated",
+                                                    &readersCreatedStats );
+
     OplogReader::OplogReader( bool doHandshake ) : 
         _doHandshake( doHandshake ) { 
         
@@ -1208,6 +1223,8 @@ namespace mongo {
         
         /* TODO: slaveOk maybe shouldn't use? */
         _tailingQueryOptions |= QueryOption_AwaitData;
+
+        readersCreatedStats.increment();
     }
 
     bool OplogReader::commonConnect(const string& hostName) {
@@ -1218,7 +1235,7 @@ namespace mongo {
             string errmsg;
             ReplInfo r("trying to connect to sync source");
             if ( !_conn->connect(hostName.c_str(), errmsg) ||
-                 (!noauth && !replAuthenticate(_conn.get())) ) {
+                 (!noauth && !replAuthenticate(_conn.get(), true)) ) {
                 resetConnection();
                 log() << "repl: " << errmsg << endl;
                 return false;
@@ -1255,13 +1272,19 @@ namespace mongo {
         return false;
     }
 
-    bool OplogReader::passthroughHandshake(const BSONObj& rid, const int f) {
+    bool OplogReader::passthroughHandshake(const BSONObj& rid, const int nextOnChainId) {
         BSONObjBuilder cmd;
-        cmd.appendAs( rid["_id"], "handshake" );
-        cmd.append( "member" , f );
+        cmd.appendAs(rid["_id"], "handshake");
+        if (theReplSet) {
+            const Member* chainedMember = theReplSet->findById(nextOnChainId);
+            if (chainedMember != NULL) {
+                cmd.append("config", chainedMember->config().asBson());
+            }
+        }
+        cmd.append("member", nextOnChainId);
 
         BSONObj res;
-        return conn()->runCommand( "admin" , cmd.obj() , res );
+        return conn()->runCommand("admin", cmd.obj(), res);
     }
 
     void OplogReader::tailingQuery(const char *ns, const BSONObj& query, const BSONObj* fields ) {

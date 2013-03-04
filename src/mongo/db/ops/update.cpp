@@ -84,10 +84,11 @@ namespace mongo {
            regular ones at the moment. */
         if ( isOperatorUpdate ) {
             const BSONObj& onDisk = loc.obj();
-            auto_ptr<ModSetState> mss = mods->prepare( onDisk );
+            auto_ptr<ModSetState> mss = mods->prepare( onDisk, false /* not an insertion */ );
 
             if( mss->canApplyInPlace() ) {
                 mss->applyModsInPlace(true);
+                debug.fastmod = true;
                 DEBUGUPDATE( "\t\t\t updateById doing in place update" );
             }
             else {
@@ -159,17 +160,8 @@ namespace mongo {
         bool isOperatorUpdate = updateobj.firstElementFieldName()[0] == '$';
         int modsIsIndexed = false; // really the # of indexes
         if ( isOperatorUpdate ) {
-            if( d && d->indexBuildsInProgress ) {
-                set<string> bgKeys;
-                for (int i = 0; i < d->indexBuildsInProgress; i++) {
-                    d->idx(d->nIndexes+i).keyPattern().getFieldNames(bgKeys);
-                }
-                mods.reset( new ModSet(updateobj, nsdt->indexKeys(), &bgKeys, forReplication) );
-            }
-            else {
-                mods.reset( new ModSet(updateobj, nsdt->indexKeys(), NULL, forReplication) );
-            }
-            modsIsIndexed = mods->isIndexed();
+            mods.reset( new ModSet(updateobj, nsdt->indexKeys(), forReplication) );
+            modsIsIndexed = mods->maxNumIndexUpdated();
         }
 
         if( planPolicy.permitOptimalIdPlan() && !multi && isSimpleIdQuery(patternOrig) && d &&
@@ -251,14 +243,9 @@ namespace mongo {
                         if ( ! d )
                             break;
                         nsdt = &NamespaceDetailsTransient::get(ns);
-                        if ( mods.get() && ! mods->isIndexed() ) {
-                            set<string> bgKeys;
-                            for (int i = 0; i < d->indexBuildsInProgress; i++) {
-                                // we need to re-check indexes
-                                d->idx(d->nIndexes+i).keyPattern().getFieldNames(bgKeys);
-                            }
-                            mods->updateIsIndexed( nsdt->indexKeys() , &bgKeys );
-                            modsIsIndexed = mods->isIndexed();
+                        if ( mods.get() ) {
+                            mods->setIndexedStatus( nsdt->indexKeys() );
+                            modsIsIndexed = mods->maxNumIndexUpdated();
                         }
 
                     }
@@ -338,7 +325,8 @@ namespace mongo {
                         mymodset.reset( useMods );
                     }
 
-                    auto_ptr<ModSetState> mss = useMods->prepare( onDisk );
+                    auto_ptr<ModSetState> mss = useMods->prepare( onDisk,
+                                                                  false /* not an insertion */ );
 
                     bool willAdvanceCursor = multi && c->ok() && ( modsIsIndexed || ! mss->canApplyInPlace() );
 
@@ -355,7 +343,7 @@ namespace mongo {
                     // order to ensure that they are validated inside DataFileMgr::updateRecord(.).
                     bool isSystemUsersMod = (NamespaceString(ns).coll == "system.users");
 
-                    if ( modsIsIndexed <= 0 && mss->canApplyInPlace() && !isSystemUsersMod ) {
+                    if ( !mss->isUpdateIndexed() && mss->canApplyInPlace() && !isSystemUsersMod ) {
                         mss->applyModsInPlace( true );// const_cast<BSONObj&>(onDisk) );
 
                         DEBUGUPDATE( "\t\t\t doing in place update" );
@@ -518,7 +506,7 @@ namespace mongo {
 
     BSONObj applyUpdateOperators( const BSONObj& from, const BSONObj& operators ) {
         ModSet mods( operators );
-        return mods.prepare( from )->createNewFromMods();
+        return mods.prepare( from, false /* not an insertion */ )->createNewFromMods();
     }
     
 }  // namespace mongo

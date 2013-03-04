@@ -18,34 +18,51 @@
 
 #include "mongo/db/instance.h"
 #include "mongo/db/pdfile.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
-    IndexRebuilder indexRebuilder;
+    // Disabled until locking at startup can be ironed out.
+    // See SERVER-8344 and SERVER-8536
+    //IndexRebuilder indexRebuilder;
 
     IndexRebuilder::IndexRebuilder() {}
 
-    std::string IndexRebuilder::name() const {
-        return "IndexRebuilder";
+    /**
+     * This resets memory tracking to its original value after all indexes are rebuilt.
+     *
+     * Before the server starts listening, all memory accesses are counted as taking 0 time (because
+     * the timer hasn't started yet).  The Record class warns about these 0-time accesses (actually,
+     * the warning is in Rolling, which is used by Record) so run() turns off the tracking to
+     * silence these warnings.  We want to make sure that they're turned back on, though, no matter
+     * how run() exits.
+     */
+    static void resetMemoryTracking(bool originalTracking) {
+        Record::MemoryTrackingEnabled = originalTracking;
     }
 
     void IndexRebuilder::run() {
-        Client::initThread(name().c_str());
-        Lock::GlobalWrite lk;
+        // Disable record access timer warnings
+        ON_BLOCK_EXIT(resetMemoryTracking, Record::MemoryTrackingEnabled);
+        Record::MemoryTrackingEnabled = false;
+
         Client::GodScope gs;
+        Lock::GlobalWrite lk;
+
+        bool firstTime = true;
         std::vector<std::string> dbNames;
         getDatabaseNames(dbNames);
 
         for (std::vector<std::string>::const_iterator it = dbNames.begin();
              it < dbNames.end();
              it++) {
-            checkDB(*it);
+            checkDB(*it, &firstTime);
         }
 
         cc().shutdown();
     }
 
-    void IndexRebuilder::checkDB(const std::string& dbName) {
+    void IndexRebuilder::checkDB(const std::string& dbName, bool* firstTime) {
         const std::string systemNS = dbName + ".system.namespaces";
         DBDirectClient cli;
         scoped_ptr<DBClientCursor> cursor(cli.query(systemNS, Query()));
@@ -55,7 +72,7 @@ namespace mongo {
             BSONObj nsDoc = cursor->next();
             const char* ns = nsDoc["name"].valuestrsafe();
 
-            Client::Context ctx(ns, dbpath, false);
+            Client::WriteContext ctx(ns);
             NamespaceDetails* nsd = nsdetails(ns);
 
             if (!nsd || !nsd->indexBuildsInProgress) {
@@ -63,6 +80,11 @@ namespace mongo {
             }
 
             log() << "Found interrupted index build on " << ns << endl;
+            if (*firstTime) {
+                log() << "Restart the server with --noIndexBuildRetry to skip index rebuilds"
+                      << endl;
+                *firstTime = false;
+            }
 
             // If the indexBuildRetry flag isn't set, just clear the inProg flag
             if (!cmdLine.indexBuildRetry) {

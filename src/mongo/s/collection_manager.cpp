@@ -43,15 +43,16 @@ namespace mongo {
         }
 
         // If left with no chunks, check that the version is zero.
-        if ((_chunksMap.size() == 1) && newShardVersion.isSet()) {
-            *errMsg = stream() << "setting version to " << newShardVersion.toString()
-                               << " on removing last chunk";
-            return NULL;
+        if (_chunksMap.size() == 1) {
+            if (newShardVersion.isSet()) {
+                *errMsg = stream() << "setting version to " << newShardVersion.toString()
+                                   << " on removing last chunk";
+                return NULL;
+            }
         }
-
         // Can't move version backwards when subtracting chunks.  This is what guarantees that
         // no read or write would be taken once we subtract data from the current shard.
-        if (newShardVersion <= _maxShardVersion) {
+        else if (newShardVersion <= _maxShardVersion) {
             *errMsg = stream() << "version " << newShardVersion.toString()
                                << " not greater than " << _maxShardVersion.toString();
             return NULL;
@@ -175,8 +176,6 @@ namespace mongo {
         manager->_key.getOwned();
         manager->_chunksMap = this->_chunksMap;
         manager->_maxShardVersion = newShardVersion; // will increment 2nd, 3rd,... chunks below
-        manager->_maxCollVersion = newShardVersion > _maxCollVersion ?
-                                   newShardVersion : this->_maxCollVersion;
 
         BSONObj startKey = chunk.getMin();
         for (vector<BSONObj>::const_iterator it = splitKeys.begin();
@@ -188,10 +187,12 @@ namespace mongo {
             manager->_maxShardVersion.incMinor();
             startKey = split;
         }
+
+        manager->_maxCollVersion = manager->_maxShardVersion > _maxCollVersion ?
+                        manager->_maxShardVersion : this->_maxCollVersion;
         manager->fillRanges();
 
         dassert(manager->isValid());
-
         return manager.release();
     }
 
@@ -202,7 +203,9 @@ namespace mongo {
             return true;
         }
 
-        dassert(_rangesMap.size() > 0);
+        if (_rangesMap.size() <= 0) {
+            return false;
+        }
 
         RangeMap::const_iterator it = _rangesMap.upper_bound(point);
         if (it != _rangesMap.begin())
@@ -268,7 +271,7 @@ namespace mongo {
             return false;
         }
 
-        if (_maxShardVersion.majorVersion() == 0 || _maxCollVersion.majorVersion() == 0)
+        if (_maxCollVersion.majorVersion() == 0)
             return false;
 
         return true;

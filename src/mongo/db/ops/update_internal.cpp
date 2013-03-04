@@ -20,10 +20,10 @@
 
 #include <algorithm> // for max
 
-#include "mongo/db/oplog.h"
-#include "mongo/db/ops/field_ref.h"
+#include "mongo/db/field_ref.h"
 #include "mongo/db/jsobjmanipulator.h"
 #include "mongo/db/pdfile.h"
+#include "mongo/db/oplog.h"
 #include "mongo/util/mongoutils/str.h"
 
 #include "update_internal.h"
@@ -109,17 +109,19 @@ namespace mongo {
             break;
         }
 
+        case SET_ON_INSERT:
+            // There is a corner case that would land us here (making a change to an existing
+            // field with $setOnInsert). If we're in an upsert, and the query portion of the
+            // update creates a field, we can modify it with $setOnInsert. This degenerates
+            // into a $set, so we fall through to the next case.
+            ms.fixedOpName = "$set";
+            // Fall through.
+
         case SET: {
             _checkForAppending( elt );
             builder.appendAs( elt , shortFieldName );
             break;
         }
-
-        case SET_ON_INSERT:
-            // $setOnInsert on an existing field should be a no-op (e.g., dontApply should be
-            // set for it), so we should never get here.
-            verify(false);
-            break;
 
         case UNSET: {
             appendUnset( builder );
@@ -171,7 +173,7 @@ namespace mongo {
                 while ( i.more() ) {
                     bb.append( i.next() );
                 }
-                BSONObjIterator j( elt.embeddedObject() );
+                BSONObjIterator j( getEach() );
                 while ( j.more() ) {
                     bb.append( j.next() );
                 }
@@ -181,8 +183,8 @@ namespace mongo {
                 ms.fixedArray = BSONArray( bb.done().getOwned() );
             }
 
-            // If we're in the "push all" case with slice, we have to decide how much of each
-            // of the existing and parameter arrays to copy to the final object.
+            // If we're in the "push with a $each" case with slice, we have to decide how much
+            // of each of the existing and parameter arrays to copy to the final object.
             else if ( isSliceOnly() ) {
                 long long slice = getSlice();
                 BSONObj eachArray = getEach();
@@ -237,7 +239,6 @@ namespace mongo {
             // decide how much of each of the resulting work area to copy to the final object.
             else {
                 long long slice = getSlice();
-                BSONObj sortPattern = getSort();
 
                 // Zero slice is equivalent to resetting the array in the final object, so
                 // we only go into sorting if there is anything to sort.
@@ -251,7 +252,8 @@ namespace mongo {
                     while ( j.more() ) {
                         workArea.push_back( j.next().Obj() );
                     }
-                    sort( workArea.begin(), workArea.end(), ProjectKeyCmp( sortPattern ) );
+                    ProjectKeyCmp cmp( getSort() );
+                    sort( workArea.begin(), workArea.end(), cmp );
 
                     long long skip = std::max( 0LL,
                                                (long long)workArea.size() - slice );
@@ -528,9 +530,11 @@ namespace mongo {
         return !obj.getField( path ).eoo();
     }
 
-    auto_ptr<ModSetState> ModSet::prepare(const BSONObj& obj) const {
+    auto_ptr<ModSetState> ModSet::prepare(const BSONObj& obj, bool insertion) const {
         DEBUGUPDATE( "\t start prepare" );
-        auto_ptr<ModSetState> mss( new ModSetState( obj ) );
+        auto_ptr<ModSetState> mss( new ModSetState( obj,
+                                                    _numIndexAlwaysUpdated,
+                                                    _numIndexMaybeUpdated ) );
 
 
         // Perform this check first, so that we don't leave a partially modified object on uassert.
@@ -586,7 +590,7 @@ namespace mongo {
                 continue;
             }
 
-            if ( e.eoo() ) {
+            if ( m.op != Mod::SET_ON_INSERT && e.eoo() ) {
                 mss->amIInPlacePossible( m.op == Mod::UNSET );
                 continue;
             }
@@ -614,13 +618,14 @@ namespace mongo {
                 break;
 
             case Mod::SET_ON_INSERT:
-                // In-place-ness was set before on the general test for e.eoo() above this
-                // switch. Just for documentation, this is what we'd like for $setOnInsert.
-                // mss->amIInPlacePossible( ! e.eoo() );
-
-                // If the element exists, $setOnInsert becomes a no-op.
-                if ( ! e.eoo() ) {
+                // If the document exist (i.e this is an update, not an insert) $setOnInsert
+                // becomes a no-op.
+                if ( !insertion ) {
                     ms.dontApply = true;
+                    mss->amIInPlacePossible( true );
+                }
+                else {
+                    mss->amIInPlacePossible( false );
                 }
                 break;
 
@@ -720,7 +725,28 @@ namespace mongo {
         return mss;
     }
 
-    void ModState::appendForOpLog( BSONObjBuilder& b ) const {
+    const char* ModState::getOpLogName() const {
+        if ( dontApply ) {
+            return NULL;
+        }
+
+        if ( incType ) {
+            return "$set";
+        }
+
+        if ( m->op == Mod::RENAME_FROM ) {
+            return "$unset";
+        }
+
+        if ( m->op == Mod::RENAME_TO ) {
+            return "$set";
+        }
+
+        return fixedOpName ? fixedOpName : Mod::modNames[op()];
+    }
+
+
+    void ModState::appendForOpLog( BSONObjBuilder& bb ) const {
         // dontApply logic is deprecated for all but $rename.
         if ( dontApply ) {
             return;
@@ -729,23 +755,18 @@ namespace mongo {
         if ( incType ) {
             DEBUGUPDATE( "\t\t\t\t\t appendForOpLog inc fieldname: " << m->fieldName
                          << " short:" << m->shortFieldName );
-            BSONObjBuilder bb( b.subobjStart( "$set" ) );
             appendIncValue( bb , true );
-            bb.done();
             return;
         }
 
         if ( m->op == Mod::RENAME_FROM ) {
             DEBUGUPDATE( "\t\t\t\t\t appendForOpLog RENAME_FROM fieldName:" << m->fieldName );
-            BSONObjBuilder bb( b.subobjStart( "$unset" ) );
             bb.append( m->fieldName, 1 );
-            bb.done();
             return;
         }
 
         if ( m->op == Mod::RENAME_TO ) {
             DEBUGUPDATE( "\t\t\t\t\t appendForOpLog RENAME_TO fieldName:" << m->fieldName );
-            BSONObjBuilder bb( b.subobjStart( "$set" ) );
             bb.appendAs( newVal, m->fieldName );
             return;
         }
@@ -756,13 +777,10 @@ namespace mongo {
                      << " fn: " << m->fieldName );
 
         if (strcmp(name, "$unset") == 0) {
-            BSONObjBuilder bb(b.subobjStart(name));
             bb.append(m->fieldName, 1);
-            bb.done();
             return;
         }
 
-        BSONObjBuilder bb( b.subobjStart( name ) );
         if ( fixed ) {
             bb.appendAs( *fixed , m->fieldName );
         }
@@ -776,7 +794,32 @@ namespace mongo {
         else {
             bb.appendAs( m->elt , m->fieldName );
         }
-        bb.done();
+
+    }
+
+    typedef map<string, vector<ModState*> > NamedModMap;
+
+    BSONObj ModSetState::getOpLogRewrite() const {
+        NamedModMap names;
+        for ( ModStateHolder::const_iterator i = _mods.begin(); i != _mods.end(); ++i ) {
+            const char* name = i->second->getOpLogName();
+            if ( ! name )
+                continue;
+            names[name].push_back( i->second.get() );
+        }
+
+        BSONObjBuilder b;
+        for ( NamedModMap::const_iterator i = names.begin();
+              i != names.end();
+              ++i ) {
+            BSONObjBuilder bb( b.subobjStart( i->first ) );
+            const vector<ModState*>& mods = i->second;
+            for ( unsigned j = 0; j < mods.size(); j++ ) {
+                mods[j]->appendForOpLog( bb );
+            }
+            bb.doneFast();
+        }
+        return b.obj();
     }
 
     string ModState::toString() const {
@@ -879,12 +922,13 @@ namespace mongo {
             modState.fixedOpName = "$unset";
             return;
 
-        // $rename may involve dotted path creation, so we want to make sure we're not
-        // creating a path here for a rename that's a no-op. In other words if we're
-        // issuing a {$rename: {a.b : c.d} } that's a no-op, we don't want to create
-        // the a and c paths here. See test NestedNoName in the 'repl' suite.
+        // $rename/$setOnInsert may involve dotted path creation, so we want to make sure we're
+        // not creating a path here for a rename that's a no-op. In other words if we're
+        // issuing a {$rename: {a.b : c.d} } that's a no-op, we don't want to create the a and
+        // c paths here. See test NestedNoName in the 'repl' suite.
         case Mod::RENAME_FROM:
         case Mod::RENAME_TO:
+        case Mod::SET_ON_INSERT:
             if (modState.dontApply) {
                 return;
             }
@@ -1089,6 +1133,40 @@ namespace mongo {
         return ss.str();
     }
 
+    bool ModSetState::isUpdateIndexedSlow() const {
+        // There may be indices over fields for which Mods are no-ops. In other words, if a
+        // Mod touches an index field but that Mod is a no-op, this update may be
+        // considered one that does not update indices.
+        if ( _numIndexMaybeUpdated == 0 ) {
+            return false;
+        }
+        else {
+            for ( ModStateHolder::const_iterator it = _mods.begin();
+                  it != _mods.end();
+                  ++it ) {
+                const Mod* m = it->second->m;
+                shared_ptr<ModState> ms = it->second;
+
+                switch ( m->op ) {
+                case Mod::SET_ON_INSERT:
+                case Mod::RENAME_FROM:
+                case Mod::RENAME_TO:
+                    if ( m->isIndexed && !ms->dontApply ) {
+                        return true;
+                    }
+                    break;
+
+                default:
+                    // no-op
+                    break;
+                }
+            }
+
+            return false;
+        }
+    }
+
+
     BSONObj ModSet::createNewFromQuery( const BSONObj& query ) {
         BSONObj newObj;
 
@@ -1106,9 +1184,16 @@ namespace mongo {
                     // this can be a query piece
                     // or can be a dbref or something
 
-                    int op = e.embeddedObject().firstElement().getGtLtOp( -1 );
-                    if ( op >= 0 ) {
-                        // this means this is a $gt type filter, so don't make part of the new object
+                    int op = e.embeddedObject().firstElement().getGtLtOp();
+                    if ( op > 0 ) {
+                        // This means this is a $gt type filter, so don't make it part of the new
+                        // object.
+                        continue;
+                    }
+
+                    if ( str::equals( e.embeddedObject().firstElement().fieldName(), "$not" ) ) {
+                        // A $not filter operator is not detected in getGtLtOp() and should not
+                        // become part of the new object.
                         continue;
                     }
                 }
@@ -1119,7 +1204,7 @@ namespace mongo {
             newObj = bb.obj();
         }
 
-        auto_ptr<ModSetState> mss = prepare( newObj );
+        auto_ptr<ModSetState> mss = prepare( newObj, true /* this is an insertion */ );
 
         if ( mss->canApplyInPlace() )
             mss->applyModsInPlace( false );
@@ -1138,12 +1223,12 @@ namespace mongo {
        { $pullAll : { a:[99,1010] } }
        NOTE: MODIFIES source from object!
     */
-    ModSet::ModSet(
-        const BSONObj& from ,
-        const set<string>& idxKeys,
-        const set<string>* backgroundKeys,
-        bool forReplication)
-        : _isIndexed(0) , _hasDynamicArray( false ) {
+    ModSet::ModSet( const BSONObj& from ,
+                    const IndexPathSet& idxKeys,
+                    bool forReplication )
+        : _numIndexMaybeUpdated( 0 )
+        , _numIndexAlwaysUpdated( 0 )
+        , _hasDynamicArray( false ) {
 
         BSONObjIterator it(from);
 
@@ -1240,8 +1325,20 @@ namespace mongo {
                                                    ( fieldSortElem.type() == NumberDouble &&
                                                      fieldSortElem.numberDouble() ==
                                                      (long long) fieldSortElem.numberDouble() ) ) &&
-                                                 fieldSortElem.Number()*fieldSortElem.Number()
-                                                 == 1.0);
+                                                 ( fieldSortElem.Number() == 1 ||
+                                                   fieldSortElem.Number() == -1 ) );
+
+                                        FieldRef sortField;
+                                        sortField.parse( fieldSortElem.fieldName() );
+                                        uassert( 16690,
+                                                 "$sort field cannot be empty",
+                                                 sortField.numParts() > 0 );
+
+                                        for ( size_t i = 0; i < sortField.numParts(); i++ ) {
+                                            uassert( 16691,
+                                                     "empty field in dotted sort pattern",
+                                                     sortField.getPart( i ).size() > 0 );
+                                        }
                                     }
 
                                     // Finally, check if the $each is made of objects (as opposed
@@ -1255,6 +1352,7 @@ namespace mongo {
                                                  "$sort requires $each to be an array of objects",
                                                  eachItem.type() == Object );
                                     }
+
                                 }
                                 else {
                                     uasserted( 16643,
@@ -1314,13 +1412,13 @@ namespace mongo {
                     Mod from;
                     from.init( Mod::RENAME_FROM, f , forReplication );
                     from.setFieldName( fieldName );
-                    updateIsIndexed( from, idxKeys, backgroundKeys );
+                    setIndexedStatus( from, idxKeys );
                     _mods[ from.fieldName ] = from;
 
                     Mod to;
                     to.init( Mod::RENAME_TO, f , forReplication );
                     to.setFieldName( target );
-                    updateIsIndexed( to, idxKeys, backgroundKeys );
+                    setIndexedStatus( to, idxKeys );
                     _mods[ to.fieldName ] = to;
 
                     DEBUGUPDATE( "\t\t " << fieldName << "\t" << from.fieldName << "\t" << to.fieldName );
@@ -1332,7 +1430,7 @@ namespace mongo {
                 Mod m;
                 m.init( op , f , forReplication );
                 m.setFieldName( f.fieldName() );
-                updateIsIndexed( m, idxKeys, backgroundKeys );
+                setIndexedStatus( m, idxKeys );
                 _mods[m.fieldName] = m;
 
                 DEBUGUPDATE( "\t\t " << fieldName << "\t" << m.fieldName << "\t" << _hasDynamicArray );
@@ -1343,7 +1441,8 @@ namespace mongo {
 
     ModSet* ModSet::fixDynamicArray( const string& elemMatchKey ) const {
         ModSet* n = new ModSet();
-        n->_isIndexed = _isIndexed;
+        n->_numIndexMaybeUpdated = _numIndexMaybeUpdated;
+        n->_numIndexAlwaysUpdated = _numIndexAlwaysUpdated;
         n->_hasDynamicArray = _hasDynamicArray;
         for ( ModHolder::const_iterator i=_mods.begin(); i!=_mods.end(); i++ ) {
             string s = i->first;
@@ -1363,9 +1462,35 @@ namespace mongo {
         return n;
     }
 
-    void ModSet::updateIsIndexed( const set<string>& idxKeys, const set<string>* backgroundKeys ) {
-        for ( ModHolder::const_iterator i = _mods.begin(); i != _mods.end(); ++i )
-            updateIsIndexed( i->second, idxKeys , backgroundKeys );
+    void ModSet::setIndexedStatus( const IndexPathSet& idxKeys ) {
+        for ( ModHolder::iterator i = _mods.begin(); i != _mods.end(); ++i )
+            setIndexedStatus( i->second, idxKeys );
     }
+
+    void ModSet::setIndexedStatus( Mod& m, const IndexPathSet& idxKeys ) {
+        if ( idxKeys.mightBeIndexed( m.fieldName ) ) {
+            m.isIndexed = true;
+
+            // Some mods may be no-ops depending on the document they are applied
+            // on. Determining how many indices will actually be used can only be
+            // determined for sure after looking at that target document.
+            switch ( m.op ) {
+
+            case Mod::SET_ON_INSERT:
+            case Mod::RENAME_FROM:
+            case Mod::RENAME_TO:
+                _numIndexMaybeUpdated++;
+                break;
+
+            default:
+                _numIndexAlwaysUpdated++;
+
+            }
+        }
+        else {
+            m.isIndexed = false;
+        }
+    }
+
 
 } // namespace mongo

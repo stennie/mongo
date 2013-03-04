@@ -23,13 +23,17 @@
 #include "mongo/db/matcher.h"
 #include "mongo/db/queryutil.h"
 #include "mongo/db/geo/s2common.h"
+#include "mongo/db/geo/geoquery.h"
+#include "mongo/platform/unordered_set.h"
+#include "third_party/s2/s2cap.h"
+#include "third_party/s2/s2regionintersection.h"
 
 namespace mongo {
     class S2NearCursor : public Cursor {
     public:
         S2NearCursor(const BSONObj &keyPattern, const IndexDetails* details, const BSONObj &query,
-                     const vector<QueryGeometry> &regions, const S2IndexingParams &params,
-                     int numWanted, double maxDistance);
+                     const NearQuery &nearQuery, const vector<GeoQuery> &indexedGeoRegions,
+                     const S2IndexingParams &params);
         virtual ~S2NearCursor(); 
         virtual CoveredIndexMatcher *matcher() const;
 
@@ -78,7 +82,7 @@ namespace mongo {
         // Grow _innerRadius and _outerRadius by _radiusIncrement, capping _outerRadius at halfway
         // around the world (pi * _params.radius).
         void nextAnnulus();
-        double distanceBetween(const QueryGeometry &field, const BSONObj &obj);
+        double distanceTo(const BSONObj &obj);
 
         // Need this to make a FieldRangeSet.
         const IndexDetails *_details;
@@ -90,32 +94,64 @@ namespace mongo {
         // FRS:     No geo fields allowed!
         // So, on that note: the query with the geo stuff taken out, used by makeFRSObject().
         BSONObj _filteredQuery;
+        // The GeoQuery for the point we're doing near searching from.
+        NearQuery _nearQuery;
         // What geo regions are we looking for?
-        vector<QueryGeometry> _fields;
+        vector<GeoQuery> _indexedGeoFields;
         // We use this for matching non-GEO stuff.
         shared_ptr<CoveredIndexMatcher> _matcher;
         // How were the keys created?  We need this to search for the right stuff.
         S2IndexingParams _params;
-        // How many things did we scan/look at?  Not sure exactly how this is defined.
-        long long _nscanned;
         // We have to pass this to the FieldRangeVector ctor (in modified form).
         BSONObj _keyPattern;
         // We also pass this to the FieldRangeVector ctor.
         IndexSpec _specForFRV;
-        // How many docs do we want to return?  Starts with the # the user requests and goes down.
-        int _numToReturn;
 
         // Geo-related variables.
         // What's the max distance (arc length) we're willing to look for results?
         double _maxDistance;
         // We compute an annulus of results and cache it here.
         priority_queue<Result> _results;
-        // These radii define the annulus.
+        // These radii define the annulus we're currently looking at.
         double _innerRadius;
         double _outerRadius;
         // When we search the next annulus, what to adjust our radius by?  Grows when we search an
         // annulus and find no results.
         double _radiusIncrement;
-        set<DiskLoc> _returned;
+        // What have we returned already?
+        unordered_set<DiskLoc, DiskLoc::Hasher> _returned;
+
+        struct Stats {
+            Stats() : _nscanned(0), _matchTested(0), _geoMatchTested(0), _numShells(0),
+                      _keyGeoSkip(0), _returnSkip(0), _btreeDups(0), _inAnnulusTested(0),
+                      _numReturned(0) {}
+            // Stat counters/debug information goes below.
+            // How many items did we look at in the btree?
+            long long _nscanned;
+            // How many did we try to match?
+            long long _matchTested;
+            // How many did we geo-test?
+            long long _geoMatchTested;
+            // How many search shells did we use?
+            long long _numShells;
+            // How many did we skip due to key-geo check?
+            long long _keyGeoSkip;
+            long long _returnSkip;
+            long long _btreeDups;
+            long long _inAnnulusTested;
+            long long _numReturned;
+        };
+
+        Stats _stats;
+
+        // The S2 machinery that represents the search annulus
+        S2Cap _innerCap;
+        S2Cap _outerCap;
+        S2RegionIntersection _annulus;
+        // This is the "array index" of the key field that is the near field.  We use this to do
+        // cheap is-this-doc-in-the-annulus testing.
+        int _nearFieldIndex;
+        // The max distance we've returned so far.
+        double _returnedDistance;
     };
 }  // namespace mongo

@@ -302,8 +302,10 @@ namespace mongo {
                             maxChunkSize = maxSizeElem.numberLong();
                         }
                     }
-                    
-                    if ( maxChunkSize <= 0 ) {
+
+                    // We need a maximum size for the chunk, unless we're not actually capable of finding any
+                    // split points.
+                    if ( maxChunkSize <= 0 && recCount != 0 ) {
                         errmsg = "need to specify the desired max chunk size (maxChunkSize or maxChunkSizeBytes)";
                         return false;
                     }
@@ -553,8 +555,7 @@ namespace mongo {
                     return false;
                 }
                 string configdb = cmdObj["configdb"].String();
-                shardingState.enable( configdb );
-                configServer.init( configdb );
+                ShardingState::initialize(configdb);
             }
 
             Shard myShard( from );

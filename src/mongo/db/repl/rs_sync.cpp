@@ -25,18 +25,40 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands/fsync.h"
 #include "mongo/db/d_concurrency.h"
+#include "mongo/db/namespacestring.h"
 #include "mongo/db/prefetch.h"
 #include "mongo/db/repl.h"
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/rs.h"
 #include "mongo/db/repl/rs_sync.h"
+#include "mongo/util/fail_point_service.h"
+#include "mongo/db/commands/server_status.h"
+#include "mongo/db/stats/timer_stats.h"
+#include "mongo/base/counter.h"
+
+
 
 namespace mongo {
 
     using namespace bson;
     extern unsigned replSetForceInitialSyncFailure;
 
+    const int ReplSetImpl::maxSyncSourceLagSecs = 30;
+
 namespace replset {
+
+    MONGO_FP_DECLARE(rsSyncApplyStop);
+
+    // Number and time of each ApplyOps worker pool round
+    static TimerStats applyBatchStats;
+    static ServerStatusMetricField<TimerStats> displayOpBatchesApplied(
+                                                    "repl.apply.batches",
+                                                    &applyBatchStats );
+    //The oplog entries applied
+    static Counter64 opsAppliedStats;
+    static ServerStatusMetricField<Counter64> displayOpsApplied( "repl.apply.ops",
+                                                                &opsAppliedStats );
+
 
     SyncTail::SyncTail(BackgroundSyncInterface *q) :
         Sync(""), oplogVersion(0), _networkQueue(q)
@@ -82,6 +104,7 @@ namespace replset {
         // For non-initial-sync, we convert updates to upserts
         // to suppress errors when replaying oplog entries.
         bool ok = !applyOperation_inlock(op, true, convertUpdateToUpsert);
+        opsAppliedStats.increment();
         getDur().commitIfNeeded();
 
         return ok;
@@ -194,6 +217,7 @@ namespace replset {
     void SyncTail::applyOps(const std::vector< std::vector<BSONObj> >& writerVectors, 
                                      MultiSyncApplyFunc applyFunc) {
         ThreadPool& writerPool = theReplSet->getWriterPool();
+        TimerHolder timer(&applyBatchStats);
         for (std::vector< std::vector<BSONObj> >::const_iterator it = writerVectors.begin();
              it != writerVectors.end();
              ++it) {
@@ -409,6 +433,11 @@ namespace replset {
                 }
             }
 
+            // For pausing replication in tests
+            while (MONGO_FAIL_POINT(rsSyncApplyStop)) {
+                sleepmillis(0);
+            }
+
             const BSONObj& lastOp = ops.getDeque().back();
             setOplogVersion(lastOp);
             handleSlaveDelay(lastOp);
@@ -452,7 +481,7 @@ namespace replset {
         if ((op["op"].valuestrsafe()[0] == 'c') ||
             // Index builds are acheived through the use of an insert op, not a command op.
             // The following line is the same as what the insert code uses to detect an index build.
-            (strstr(op["ns"].valuestrsafe(), ".system.indexes"))) {
+            (NamespaceString(op["ns"].valuestrsafe()).coll == "system.indexes")) {
             if (ops->empty()) {
                 // apply commands one-at-a-time
                 ops->push_back(op);
@@ -550,23 +579,22 @@ namespace replset {
     bool ReplSetImpl::tryToGoLiveAsASecondary(OpTime& /*out*/ minvalid) {
         bool golive = false;
 
-        // make sure we're not primary or secondary already
-        if (box.getState().primary() || box.getState().secondary()) {
+        lock rsLock( this );
+        Lock::GlobalWrite writeLock;
+
+        // make sure we're not primary, secondary, or fatal already
+        if (box.getState().primary() || box.getState().secondary() || box.getState().fatal()) {
             return false;
         }
 
-        {
-            lock lk( this );
+        if (_maintenanceMode > 0) {
+            // we're not actually going live
+            return true;
+        }
 
-            if (_maintenanceMode > 0) {
-                // we're not actually going live
-                return true;
-            }
-
-            // if we're blocking sync, don't change state
-            if (_blockSync) {
-                return false;
-            }
+        // if we're blocking sync, don't change state
+        if (_blockSync) {
+            return false;
         }
 
         minvalid = getMinValid();
@@ -662,7 +690,8 @@ namespace replset {
 
     bool ReplSetImpl::shouldChangeSyncTarget(const OpTime& targetOpTime) const {
         for (Member *m = _members.head(); m; m = m->next()) {
-            if (m->syncable() && targetOpTime.getSecs()+30 < m->hbinfo().opTime.getSecs()) {
+            if (m->syncable() &&
+                targetOpTime.getSecs()+maxSyncSourceLagSecs < m->hbinfo().opTime.getSecs()) {
                 return true;
             }
         }
@@ -681,8 +710,10 @@ namespace replset {
             return;
         }
 
-        /* do we have anything at all? */
-        if (getMinValid().isNull() || lastOpTimeWritten.isNull()) {
+        // Check criteria for doing an initial sync:
+        // 1. If the oplog is empty, do an initial sync
+        // 2. If minValid has _initialSyncFlag set, do an initial sync
+        if (lastOpTimeWritten.isNull() || getInitialSyncFlag()) {
             syncDoInitialSync();
             return; // _syncThread will be recalled, starts from top again in case sync failed.
         }
@@ -744,6 +775,7 @@ namespace replset {
     }
 
     void ReplSetImpl::blockSync(bool block) {
+        // RS lock is already taken in Manager::checkAuth
         _blockSync = block;
         if (_blockSync) {
             // syncing is how we get into SECONDARY state, so we'll be stuck in

@@ -79,7 +79,8 @@ namespace mongo {
     extern int lockFile;
     extern string repairpath;
 
-    void setupSignals( bool inFork );
+    static void setupSignalHandlers();
+    static void startInterruptThread();
     void startReplication();
     void exitCleanly( ExitCode code );
 
@@ -390,34 +391,13 @@ namespace mongo {
      *          --replset.
      */
     unsigned long long checkIfReplMissingFromCommandLine() {
-        Lock::GlobalWrite lk; // _openAllFiles is false at this point, so this is helpful for the query below to work as you can't open files when readlocked
+        Lock::GlobalWrite lk; // this is helpful for the query below to work as you can't open files when readlocked
         if( !cmdLine.usingReplSets() ) {
             Client::GodScope gs;
             DBDirectClient c;
             return c.count("local.system.replset");
         }
         return 0;
-    }
-
-    void clearTmpCollections() {
-        Lock::GlobalWrite lk; // _openAllFiles is false at this point, so this is helpful for the query below to work as you can't open files when readlocked
-        Client::GodScope gs;
-        vector< string > toDelete;
-        DBDirectClient cli;
-        vector< string > dbNames;
-        getDatabaseNames( dbNames );
-        for (vector<string>::const_iterator it(dbNames.begin()), end(dbNames.end()); it != end; ++it){
-            const string coll = *it + ".system.namespaces";
-            scoped_ptr< DBClientCursor > c (cli.query(coll, Query( fromjson( "{'options.temp': {$in: [true, 1]}}" ) ) ));
-            while( c->more() ) {
-                BSONObj o = c->next();
-                toDelete.push_back( o.getStringField( "name" ) );
-            }
-        }
-        for( vector< string >::iterator i = toDelete.begin(); i != toDelete.end(); ++i ) {
-            log() << "Dropping old temporary collection: " << *i << endl;
-            cli.dropCollection( *i );
-        }
     }
 
     /**
@@ -557,7 +537,7 @@ namespace mongo {
                     log() << "**          We suggest setting it to 256KB (512 sectors) or less"
                             << startupWarningsLog;
 
-                    log() << "**          http://www.mongodb.org/display/DOCS/Readahead"
+                    log() << "**          http://dochub.mongodb.org/core/readahead"
                             << startupWarningsLog;
                 }
             }
@@ -568,8 +548,6 @@ namespace mongo {
     void _initAndListen(int listenPort ) {
 
         Client::initThread("initandlisten");
-
-        Database::_openAllFiles = false;
 
         Logstream::get().addGlobalTee( new RamLog("global") );
 
@@ -626,9 +604,6 @@ namespace mongo {
         if( cmdLine.durOptions & CmdLine::DurRecoverOnly )
             return;
 
-        // comes after getDur().startup() because this reads from the database
-        clearTmpCollections();
-
         unsigned long long missingRepl = checkIfReplMissingFromCommandLine();
         if (missingRepl) {
             log() << startupWarningsLog;
@@ -637,7 +612,7 @@ namespace mongo {
             log() << "**          Restart with --replSet unless you are doing maintenance and no"
                   << " other clients are connected." << startupWarningsLog;
             log() << "**          The TTL collection monitor will not start because of this." << startupWarningsLog;
-            log() << "**          For more info see http://www.mongodb.org/display/DOCS/TTL+Monitor" << startupWarningsLog;
+            log() << "**          For more info see http://dochub.mongodb.org/core/ttlcollections" << startupWarningsLog;
             log() << startupWarningsLog;
         }
 
@@ -651,18 +626,11 @@ namespace mongo {
 
         repairDatabasesAndCheckVersion();
 
-        /* we didn't want to pre-open all files for the repair check above. for regular
-           operation we do for read/write lock concurrency reasons.
-        */
-        Database::_openAllFiles = true;
-
         if ( shouldRepairDatabases )
             return;
 
         /* this is for security on certain platforms (nonce generation) */
         srand((unsigned) (curTimeMicros() ^ startupSrandTimer.micros()));
-
-        indexRebuilder.go();
 
         snapshotThread.go();
         d.clientCursorMonitor.go();
@@ -779,8 +747,8 @@ static void buildOptionsDescriptions(po::options_description *pVisible,
     ("jsonp","allow JSONP access via http (has security implications)")
     ("noauth", "run without security")
     ("nohttpinterface", "disable http interface")
-    ("noIndexBuildRetry", po::value<int>(),
-        "don't retry any index builds that were interrupted by shutdown")
+        // SERVER-8536
+        //   ("noIndexBuildRetry", "don't retry any index builds that were interrupted by shutdown")
     ("nojournal", "disable journaling (journaling is on by default for 64 bit)")
     ("noprealloc", "disable data file preallocation - will often hurt performance")
     ("noscripting", "disable scripting engine")
@@ -1137,7 +1105,7 @@ static void processCommandLineOptions(const std::vector<std::string>& argv) {
             if ( params.count( "dbpath" ) == 0 )
                 dbpath = "/data/configdb";
             replSettings.master = true;
-            if ( params.count( "oplogsize" ) == 0 )
+            if ( params.count( "oplogSize" ) == 0 )
                 cmdLine.oplogSize = 5 * 1024 * 1024;
         }
         if ( params.count( "profile" ) ) {
@@ -1266,8 +1234,7 @@ static int mongoDbMain(int argc, char* argv[], char **envp) {
 
     getcurns = ourgetns;
 
-    setupCoreSignals();
-    setupSignals( false );
+    setupSignalHandlers();
 
     dbExecCommand = argv[0];
 
@@ -1292,6 +1259,10 @@ static int mongoDbMain(int argc, char* argv[], char **envp) {
 
     if (!initializeServerGlobalState())
         ::_exit(EXIT_FAILURE);
+
+    // Per SERVER-7434, startInterruptThread() must run after any forks
+    // (initializeServerGlobalState()) and before creation of any other threads.
+    startInterruptThread();
 
     dataFileSync.go();
 
@@ -1387,7 +1358,9 @@ namespace mongo {
 
     void setupSignals_ignoreHelper( int signal ) {}
 
-    void setupSignals( bool inFork ) {
+    void setupSignalHandlers() {
+        setupCoreSignals();
+
         struct sigaction addrSignals;
         memset( &addrSignals, 0, sizeof( struct sigaction ) );
         addrSignals.sa_sigaction = abruptQuitWithAddrSignal;
@@ -1405,20 +1378,20 @@ namespace mongo {
 
         setupSIGTRAPforGDB();
 
+        // asyncSignals is a global variable listing the signals that should be handled by the
+        // interrupt thread, once it is started via startInterruptThread().
         sigemptyset( &asyncSignals );
-
-        if ( inFork )
-            verify( signal( SIGHUP , setupSignals_ignoreHelper ) != SIG_ERR );
-        else
-            sigaddset( &asyncSignals, SIGHUP );
-
+        sigaddset( &asyncSignals, SIGHUP );
         sigaddset( &asyncSignals, SIGINT );
         sigaddset( &asyncSignals, SIGTERM );
-        verify( pthread_sigmask( SIG_SETMASK, &asyncSignals, 0 ) == 0 );
-        boost::thread it( interruptThread );
 
         set_terminate( myterminate );
         set_new_handler( my_new_handler );
+    }
+
+    void startInterruptThread() {
+        verify( pthread_sigmask( SIG_SETMASK, &asyncSignals, 0 ) == 0 );
+        boost::thread it( interruptThread );
     }
 
 #else   // WIN32
@@ -1484,7 +1457,7 @@ namespace mongo {
         mongoAbort("pure virtual");
     }
 
-    void setupSignals( bool inFork ) {
+    void setupSignalHandlers() {
         reportEventToSystem = reportEventToSystemImpl;
         setWindowsUnhandledExceptionFilter();
         massert(10297,
@@ -1492,6 +1465,8 @@ namespace mongo {
                 SetConsoleCtrlHandler(static_cast<PHANDLER_ROUTINE>(CtrlHandler), TRUE));
         _set_purecall_handler( myPurecallHandler );
     }
+
+    void startInterruptThread() {}
 
 #endif  // if !defined(_WIN32)
 

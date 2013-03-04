@@ -967,8 +967,7 @@ namespace mongo {
                     return false;
                 }
                 string configdb = cmdObj["configdb"].String();
-                shardingState.enable( configdb );
-                configServer.init( configdb );
+                ShardingState::initialize(configdb);
             }
 
             MoveTimingHelper timing( "from" , ns , min , max , 6 /* steps */ , errmsg );
@@ -1090,6 +1089,12 @@ namespace mongo {
                 // TODO: Make this less fragile
                 startingVersion = maxVersion;
                 shardingState.trySetVersion( ns , startingVersion /* will return updated */ );
+
+                if (startingVersion.majorVersion() == 0) {
+                   // It makes no sense to migrate if our version is zero and we have no chunks, so return
+                   warning() << "moveChunk cannot start migration with zero version" << endl;
+                   return false;
+                }
 
                 log() << "moveChunk request accepted at version " << startingVersion << migrateLog;
             }
@@ -2006,7 +2011,7 @@ namespace mongo {
             }
 
             if ( ! configServer.ok() )
-                configServer.init( cmdObj["configServer"].String() );
+                ShardingState::initialize(cmdObj["configServer"].String());
 
             migrateStatus.prepare();
 

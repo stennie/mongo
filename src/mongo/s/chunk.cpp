@@ -577,7 +577,18 @@ namespace mongo {
                                          << " to " << csize << "MB" << endl;
         }
 
-        Chunk::MaxChunkSize = csize * 1024 * 1024;
+        if ( !setMaxChunkSizeSizeMB( csize ) ) {
+            warning() << "invalid MaxChunkSize: " << csize << endl;
+        }
+    }
+
+    bool Chunk::setMaxChunkSizeSizeMB( int newMaxChunkSize ) {
+        if ( newMaxChunkSize < 1 )
+            return false;
+        if ( newMaxChunkSize > 1024 )
+            return false;
+        MaxChunkSize = newMaxChunkSize * 1024 * 1024;
+        return true;
     }
 
     // -------  ChunkManager --------
@@ -765,6 +776,8 @@ namespace mongo {
                                              oldC->getMax(),
                                              oldC->getShard(),
                                              oldC->getLastmod() ) );
+
+                c->setBytesWritten( oldC->getBytesWritten() );
 
                 chunkMap.insert( make_pair( oldC->getMax(), c ) );
             }

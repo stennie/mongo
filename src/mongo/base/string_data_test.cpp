@@ -124,18 +124,45 @@ namespace {
     }
 
     // this is to verify we match std::string
-#define SUBSTR_TEST_HELP(big,small,start,len)   \
-    ASSERT_EQUALS( (string)small, ((string)big).substr( start, len ) ); \
-    ASSERT_EQUALS( StringData(small), StringData(big).substr( start, len ) );
+    void SUBSTR_TEST_HELP(StringData big, StringData small, size_t start, size_t len) {
+        ASSERT_EQUALS(small.toString(), big.toString().substr(start, len));
+        ASSERT_EQUALS(small, StringData(big).substr(start, len));
+    }
+    void SUBSTR_TEST_HELP(StringData big, StringData small, size_t start) {
+        ASSERT_EQUALS(small.toString(), big.toString().substr(start));
+        ASSERT_EQUALS(small, StringData(big).substr(start));
+    }
+
+// [12] is number of args to substr
+#define SUBSTR_1_TEST_HELP(big,small,start)   \
+    ASSERT_EQUALS( StringData(small).toString(), StringData(big).toString().substr(start) ); \
+    ASSERT_EQUALS( StringData(small), StringData(big).substr(start) );
+
+#define SUBSTR_2_TEST_HELP(big,small,start,len)   \
+    ASSERT_EQUALS( StringData(small).toString(), StringData(big).toString().substr(start, len) ); \
+    ASSERT_EQUALS( StringData(small), StringData(big).substr(start, len) );
 
     TEST(Substr, Simple1 ) {
-        SUBSTR_TEST_HELP( "abcde", "abcde", 0, 10 );
-        SUBSTR_TEST_HELP( "abcde", "abcde", 0, 5 );
-        SUBSTR_TEST_HELP( "abcde", "abc", 0, 3 );
-        SUBSTR_TEST_HELP( "abcde", "cde", 2, 5 );
-        SUBSTR_TEST_HELP( "abcde", "cde", 2, 3 );
-        SUBSTR_TEST_HELP( "abcde", "cd", 2, 2 );
-        SUBSTR_TEST_HELP( "abcde", "cd", 2, 2 );
+        SUBSTR_1_TEST_HELP( "abcde", "abcde", 0 );
+        SUBSTR_2_TEST_HELP( "abcde", "abcde", 0, 10 );
+        SUBSTR_2_TEST_HELP( "abcde", "abcde", 0, 5 );
+        SUBSTR_2_TEST_HELP( "abcde", "abc", 0, 3 );
+        SUBSTR_1_TEST_HELP( "abcde", "cde", 2 );
+        SUBSTR_2_TEST_HELP( "abcde", "cde", 2, 5 );
+        SUBSTR_2_TEST_HELP( "abcde", "cde", 2, 3 );
+        SUBSTR_2_TEST_HELP( "abcde", "cd", 2, 2 );
+        SUBSTR_2_TEST_HELP( "abcde", "cd", 2, 2 );
+        SUBSTR_1_TEST_HELP( "abcde", "", 5 );
+        SUBSTR_2_TEST_HELP( "abcde", "", 5, 0 );
+        SUBSTR_2_TEST_HELP( "abcde", "", 5, 10 );
+
+        // make sure we don't blow past the end of the StringData
+        SUBSTR_1_TEST_HELP( StringData("abcdeXXX", 5), "abcde", 0);
+        SUBSTR_2_TEST_HELP( StringData("abcdeXXX", 5), "abcde", 0, 10);
+        SUBSTR_1_TEST_HELP( StringData("abcdeXXX", 5), "de", 3);
+        SUBSTR_2_TEST_HELP( StringData("abcdeXXX", 5), "de", 3, 7);
+        SUBSTR_1_TEST_HELP( StringData("abcdeXXX", 5), "", 5);
+        SUBSTR_2_TEST_HELP( StringData("abcdeXXX", 5), "", 5, 1);
     }
 
     TEST( equalCaseInsensitiveTest, Simple1 ) {
@@ -146,6 +173,39 @@ namespace {
         ASSERT( StringData( "ABC" ).equalCaseInsensitive( "AbC" ) );
         ASSERT( !StringData( "ABC" ).equalCaseInsensitive( "AbCd" ) );
         ASSERT( !StringData( "ABC" ).equalCaseInsensitive( "AdC" ) );
+    }
+
+    TEST(StartsWith, Simple) {
+        ASSERT(StringData("").startsWith(""));
+        ASSERT(!StringData("").startsWith("x"));
+        ASSERT(StringData("abcde").startsWith(""));
+        ASSERT(StringData("abcde").startsWith("a"));
+        ASSERT(StringData("abcde").startsWith("ab"));
+        ASSERT(StringData("abcde").startsWith("abc"));
+        ASSERT(StringData("abcde").startsWith("abcd"));
+        ASSERT(StringData("abcde").startsWith("abcde"));
+        ASSERT(!StringData("abcde").startsWith("abcdef"));
+        ASSERT(!StringData("abcde").startsWith("abdce"));
+        ASSERT(StringData("abcde").startsWith(StringData("abcdeXXXX").substr(0, 4)));
+        ASSERT(!StringData("abcde").startsWith(StringData("abdef").substr(0, 4)));
+        ASSERT(!StringData("abcde").substr(0, 3).startsWith("abcd"));
+    }
+
+    TEST(EndsWith, Simple) {
+        //ASSERT(StringData("").endsWith(""));
+        ASSERT(!StringData("").endsWith("x"));
+        //ASSERT(StringData("abcde").endsWith(""));
+        ASSERT(StringData("abcde").endsWith(StringData("e", 0)));
+        ASSERT(StringData("abcde").endsWith("e"));
+        ASSERT(StringData("abcde").endsWith("de"));
+        ASSERT(StringData("abcde").endsWith("cde"));
+        ASSERT(StringData("abcde").endsWith("bcde"));
+        ASSERT(StringData("abcde").endsWith("abcde"));
+        ASSERT(!StringData("abcde").endsWith("0abcde"));
+        ASSERT(!StringData("abcde").endsWith("abdce"));
+        ASSERT(StringData("abcde").endsWith(StringData("bcdef").substr(0, 4)));
+        ASSERT(!StringData("abcde").endsWith(StringData("bcde", 3)));
+        ASSERT(!StringData("abcde").substr(0, 3).endsWith("cde"));
     }
 
 } // unnamed namespace

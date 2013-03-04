@@ -27,6 +27,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/index.h"
 #include "mongo/db/namespacestring.h"
+#include "mongo/db/stats/counters.h"
 #include "mongo/s/client_info.h"
 #include "mongo/s/chunk.h"
 #include "mongo/s/chunk_version.h"
@@ -43,7 +44,7 @@ namespace mongo {
     class ShardStrategy : public Strategy {
 
         bool _isSystemIndexes( const char* ns ) {
-            return strstr( ns , ".system.indexes" ) == strchr( ns , '.' ) && strchr( ns , '.' );
+            return NamespaceString(ns).coll == "system.indexes";
         }
 
         virtual void queryOp( Request& r ) {
@@ -613,6 +614,8 @@ namespace mongo {
                             // error gets checked on a different connection!
                             //
                             dbcon.done();
+
+                            globalOpCounters.incInsertInWriteLock(group.inserts.size());
 
                             //
                             // CHECK INTERMEDIATE ERROR
@@ -1192,8 +1195,7 @@ namespace mongo {
 
                 int * x = (int*)(r.d().afterNS());
                 x[0] |= RemoveOption_Broadcast; // this means don't check shard version in mongod
-                // TODO: Why is this an update op here?
-                broadcastWrite( dbUpdate, r );
+                broadcastWrite(dbDelete, r);
                 return;
             }
 

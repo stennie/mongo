@@ -25,7 +25,7 @@
 namespace mongo {
 
 namespace {
-    MONGO_EXPORT_SERVER_PARAMETER(enableLocalhostAuthBypass, bool, true);
+    MONGO_EXPORT_STARTUP_SERVER_PARAMETER(enableLocalhostAuthBypass, bool, true);
 } // namespace
 
     // NOTE: we default _allowLocalhost to true under the assumption that _checkShouldAllowLocalhost
@@ -40,6 +40,11 @@ namespace {
         // If we know that an admin user exists, don't re-check.
         if (!_allowLocalhost)
             return;
+        // Don't bother checking if we're not on a localhost connection
+        if (!ClientBasic::getCurrent()->getIsLocalHostConnection()) {
+            _allowLocalhost = false;
+            return;
+        }
 
         _allowLocalhost = !_hasPrivilegeDocument("admin");
         if (_allowLocalhost) {

@@ -199,7 +199,7 @@ DB.prototype.__pwHash = function( nonce, username, pass ) {
     return hex_md5(nonce + username + _hashPassword(username, pass));
 }
 
-DB.prototype._defaultAuthenticationMechanism = "MONGO-CR";
+DB.prototype._defaultAuthenticationMechanism = "MONGODB-CR";
 
 DB.prototype._authOrThrow = function () {
     var params;
@@ -219,16 +219,13 @@ DB.prototype._authOrThrow = function () {
     if (params.mechanism === undefined)
         params.mechanism = this._defaultAuthenticationMechanism;
 
-    if (params.mechanism == "MONGO-CR") {
-        this.getMongo().auth(this.getName(), params.user, params.pwd);
+    if (params.userSource !== undefined) {
+        throw Error("Do not override userSource field on db.auth().  " +
+                    "Use getMongo().auth(), instead.");
     }
-    else if (typeof(this.getMongo().saslAuthenticate == "function")) {
-        params.userSource = this.getName();
-        this.getMongo().saslAuthenticate(params);
-    }
-    else {
-        throw Error("This shell does not support sasl authentication");
-    }
+
+    params.userSource = this.getName();
+    return this.getMongo().auth(params);
 }
 
 
@@ -486,13 +483,24 @@ DB.prototype.help = function() {
     return __magicNoPrint;
 }
 
-DB.prototype.printCollectionStats = function(scale){
-
-    /* no error checking on scale, done in stats already */
-
+DB.prototype.printCollectionStats = function(scale) { 
+    if (arguments.length > 1) { 
+        print("printCollectionStats() has a single optional argument (scale)");
+        return;
+    }
+    if (typeof scale != 'undefined') {
+        if(typeof scale != 'number') {
+            print("scale has to be a number >= 1");
+            return;
+        }
+        if (scale < 1) {
+            print("scale has to be >= 1");
+            return;
+        }
+    }
     var mydb = this;
     this.getCollectionNames().forEach(
-        function(z){
+        function(z) {
             print( z );
             printjson( mydb.getCollection(z).stats(scale) );
             print( "---" );
@@ -526,37 +534,6 @@ DB.prototype.setProfilingLevel = function(level,slowms) {
         cmd["slowms"] = slowms;
     return this._dbCommand( cmd );
 }
-
-DB.prototype._initExtraInfo = function() {
-    if ( typeof _verboseShell === 'undefined' || !_verboseShell ) return;
-    this.startTime = new Date().getTime();
-}
-
-DB.prototype._getExtraInfo = function(action) {
-    if ( typeof _verboseShell === 'undefined' || !_verboseShell ) {
-        __callLastError = true;
-        return;
-    }
-
-    // explicit w:1 so that replset getLastErrorDefaults aren't used here which would be bad.
-    var res = this.getLastErrorCmd(1); 
-    if (res) {
-        if (res.err != undefined && res.err != null) {
-            // error occurred, display it
-            print(res.err);
-            return;
-        }
-
-        var info = action + " ";  
-        // hack for inserted because res.n is 0
-        info += action != "Inserted" ? res.n : 1;
-        if (res.n > 0 && res.updatedExisting != undefined) info += " " + (res.updatedExisting ? "existing" : "new")  
-        info += " record(s)";  
-        var time = new Date().getTime() - this.startTime;  
-        info += " in " + time + "ms";
-        print(info);
-    }
-} 
 
 /**
  *  <p> Evaluate a js expression at the database server.</p>
@@ -937,8 +914,12 @@ DB.prototype.serverBuildInfo = function(){
     return this._adminCommand( "buildinfo" );
 }
 
-DB.prototype.serverStatus = function(){
-    return this._adminCommand( "serverStatus" );
+DB.prototype.serverStatus = function( options ){
+    var cmd = { serverStatus : 1 };
+    if ( options ) {
+        Object.extend( cmd, options );
+    }
+    return this._adminCommand( cmd );
 }
 
 DB.prototype.hostInfo = function(){

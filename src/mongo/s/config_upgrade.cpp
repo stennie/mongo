@@ -25,6 +25,7 @@
 #include "mongo/s/mongo_version_range.h"
 #include "mongo/s/type_config_version.h"
 #include "mongo/s/type_database.h"
+#include "mongo/s/type_settings.h"
 #include "mongo/s/type_shard.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/version.h"
@@ -246,7 +247,8 @@ namespace mongo {
 
         // Check that the mongo version of this process hasn't been excluded from the cluster
         vector<MongoVersionRange> excludedRanges;
-        if (!MongoVersionRange::parseBSONArray(versionInfo.getExcludedRanges(),
+        if (versionInfo.isExcludingMongoVersionsSet() &&
+            !MongoVersionRange::parseBSONArray(versionInfo.getExcludingMongoVersions(),
                                                &excludedRanges,
                                                whyNot))
         {
@@ -274,6 +276,67 @@ namespace mongo {
         }
 
         return VersionStatus_NeedUpgrade;
+    }
+
+    // Returns true if we can confirm the balancer is stopped
+    bool _isBalancerStopped(const ConnectionString& configLoc, string* errMsg) {
+        
+        // Get the balancer information
+        scoped_ptr<ScopedDbConnection> connPtr;
+        
+        BSONObj balancerDoc;
+        try {
+            connPtr.reset(ScopedDbConnection::getInternalScopedDbConnection(configLoc, 30));
+            ScopedDbConnection& conn = *connPtr;
+            
+            balancerDoc = conn->findOne(SettingsType::ConfigNS,
+                                        BSON(SettingsType::key("balancer")));
+        }
+        catch (const DBException& e) {
+            *errMsg = e.toString();
+            return false;
+        }
+
+        connPtr->done();
+        
+        return balancerDoc[SettingsType::balancerStopped()].trueValue();
+    }
+
+    // Checks that all config servers are online
+    bool _checkConfigServersAlive(const ConnectionString& configLoc, string* errMsg) {
+        
+        scoped_ptr<ScopedDbConnection> connPtr;
+
+        bool resultOk;
+        BSONObj result;
+        try {
+            connPtr.reset(ScopedDbConnection::getInternalScopedDbConnection(configLoc, 30));
+            ScopedDbConnection& conn = *connPtr;
+            
+            if (conn->type() == ConnectionString::SYNC) {
+                // TODO: Dynamic cast is bad, we need a better way of managing this op
+                // via the heirarchy (or not)
+                SyncClusterConnection* scc = dynamic_cast<SyncClusterConnection*>(conn.get());
+                fassert(16729, scc != NULL);
+                return scc->prepare(*errMsg);
+            }
+            else {
+                resultOk = conn->runCommand("admin", BSON( "fsync" << 1 ), result); 
+            }
+        }
+        catch (const DBException& e) {
+            *errMsg = e.toString();
+            return false;
+        }
+
+        connPtr->done();
+        
+        if (!resultOk) {
+            *errMsg = DBClientWithCommands::getLastErrorString(result);
+            return false;
+        }
+        
+        return true;            
     }
 
     // Dispatches upgrades based on version to the upgrades registered in the upgrade registry
@@ -391,14 +454,43 @@ namespace mongo {
         // if possible.
         //
 
+        // The first empty version is technically an upgrade, but has special semantics
+        bool isEmptyVersion = versionInfo->getCurrentVersion() == UpgradeHistory_EmptyVersion;
+
         // First check for the upgrade flag (but no flag is needed if we're upgrading from empty)
-        if (!versionInfo->getCurrentVersion() == UpgradeHistory_EmptyVersion && !upgrade) {
+        if (!isEmptyVersion && !upgrade) {
 
             *errMsg = stream() << "newer version " << CURRENT_CONFIG_VERSION
                                << " of mongo config metadata is required, " << "current version is "
                                << versionInfo->getCurrentVersion() << ", "
                                << "need to run mongos with --upgrade";
 
+            return false;
+        }
+
+        // Contact the config servers to make sure all are online - otherwise we wait a long time
+        // for locks.
+        if (!_checkConfigServersAlive(configLoc, errMsg)) {
+
+            if (isEmptyVersion) {
+                *errMsg = stream() << "all config servers must be reachable for initial"
+                                   << " config database creation" << causedBy(errMsg);
+            }
+            else {
+                *errMsg = stream() << "all config servers must be reachable for config upgrade"
+                                   << causedBy(errMsg);
+            }
+            
+            return false;
+        }
+
+        // Check whether or not the balancer is online, if it is online we will not upgrade
+        // (but we will initialize the config server)
+        if (!isEmptyVersion && !_isBalancerStopped(configLoc, errMsg)) {
+            
+            *errMsg = stream() << "balancer must be stopped for config upgrade"
+                               << causedBy(errMsg);
+            
             return false;
         }
 
@@ -413,7 +505,7 @@ namespace mongo {
         upgradeLock.setLockMessage(stream() << "upgrading config database to new format v"
                                             << CURRENT_CONFIG_VERSION);
 
-        if (!upgradeLock.acquire(15 * 60 * 1000, errMsg)) {
+        if (!upgradeLock.acquire(20 * 60 * 1000, errMsg)) {
 
             *errMsg = stream() << "could not acquire upgrade lock for config upgrade to v"
                                << CURRENT_CONFIG_VERSION << causedBy(errMsg);

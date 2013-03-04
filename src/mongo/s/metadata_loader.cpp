@@ -80,11 +80,15 @@ namespace mongo {
             errMsg = &dummy;
         }
 
-        CollectionManager* manager = new CollectionManager;
-        if (initCollection(ns, shard, oldManager, manager, errMsg)) {
-            dassert(manager->isValid());
-            return manager;
+        auto_ptr<CollectionManager> manager(new CollectionManager);
+        if (initCollection(ns, shard, oldManager, manager.get(), errMsg)) {
+            if (manager->getNumChunks() > 0) {
+                dassert(manager->isValid());
+            }
+
+            return manager.release();
         }
+
         return NULL;
     }
 
@@ -223,7 +227,7 @@ namespace mongo {
                 return false;
             }
 
-            // Diff tracker should *always* find at least one chunk if collection exists.
+            // Diff tracker should *always* find at least one chunk if this shard owns a chunk.
             int diffsApplied = differ.calculateConfigDiff(*cursor);
             if (diffsApplied > 0) {
 
@@ -238,16 +242,14 @@ namespace mongo {
             }
             else if(diffsApplied == 0) {
 
-                *errMsg = str::stream() << "no chunks found when reloading " << ns
-                                        << ", previous version was "
-                                        << manager->_maxCollVersion.toString();
-
-                warning() << *errMsg << endl;
+                warning() << "no chunks found when reloading " << ns
+                          << ", previous version was "
+                          << manager->_maxCollVersion.toString() << endl;
 
                 manager->_maxCollVersion = ChunkVersion();
                 manager->_chunksMap.clear();
                 connPtr->done();
-                return false;
+                return true;
             }
             else{
 

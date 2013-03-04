@@ -65,9 +65,8 @@ namespace {
     const std::string SYSTEM_ROLE_READ_WRITE = "readWrite";
     const std::string SYSTEM_ROLE_USER_ADMIN = "userAdmin";
     const std::string SYSTEM_ROLE_DB_ADMIN = "dbAdmin";
-    const std::string SYSTEM_ROLE_SERVER_ADMIN = "serverAdmin";
     const std::string SYSTEM_ROLE_CLUSTER_ADMIN = "clusterAdmin";
-    const std::string SYSTEM_ROLE_READ_ANY_DB = "readAnyDB";
+    const std::string SYSTEM_ROLE_READ_ANY_DB = "readAnyDatabase";
     const std::string SYSTEM_ROLE_READ_WRITE_ANY_DB = "readWriteAnyDatabase";
     const std::string SYSTEM_ROLE_USER_ADMIN_ANY_DB = "userAdminAnyDatabase";
     const std::string SYSTEM_ROLE_DB_ADMIN_ANY_DB = "dbAdminAnyDatabase";
@@ -80,18 +79,16 @@ namespace {
     ActionSet readWriteRoleActions;
     ActionSet userAdminRoleActions;
     ActionSet dbAdminRoleActions;
-    // Separate serverAdmin and clusterAdmin read-only and read-write action for backwards
-    // compatibility with old-style read-only admin users.
-    ActionSet serverAdminRoleReadActions;
-    ActionSet serverAdminRoleWriteActions;
-    ActionSet serverAdminRoleActions;
-    ActionSet clusterAdminRoleReadActions;
-    ActionSet clusterAdminRoleWriteActions;
     ActionSet clusterAdminRoleActions;
     // Can only be performed by internal connections.  Nothing ever explicitly grants these actions,
     // but they're included when calling addAllActions on an ActionSet, which is how internal
     // connections are granted their privileges.
     ActionSet internalActions;
+    // Old-style user roles
+    ActionSet compatibilityReadOnlyActions;
+    ActionSet compatibilityReadWriteActions;
+    ActionSet compatibilityReadOnlyAdminActions;
+    ActionSet compatibilityReadWriteAdminActions;
 
     // This sets up the system role ActionSets.  This is what determines what actions each role
     // is authorized to perform
@@ -102,6 +99,8 @@ namespace {
         readRoleActions.addAction(ActionType::dbHash);
         readRoleActions.addAction(ActionType::dbStats);
         readRoleActions.addAction(ActionType::find);
+        readRoleActions.addAction(ActionType::indexRead);
+        readRoleActions.addAction(ActionType::killCursors);
 
         // Read-write role
         readWriteRoleActions.addAllActionsFromSet(readRoleActions);
@@ -122,6 +121,7 @@ namespace {
 
         // DB admin role
         dbAdminRoleActions.addAction(ActionType::clean);
+        dbAdminRoleActions.addAction(ActionType::cloneCollectionLocalSource);
         dbAdminRoleActions.addAction(ActionType::collMod);
         dbAdminRoleActions.addAction(ActionType::collStats);
         dbAdminRoleActions.addAction(ActionType::compact);
@@ -131,6 +131,7 @@ namespace {
         dbAdminRoleActions.addAction(ActionType::dropCollection);
         dbAdminRoleActions.addAction(ActionType::dropIndexes);
         dbAdminRoleActions.addAction(ActionType::ensureIndex);
+        dbAdminRoleActions.addAction(ActionType::indexRead);
         dbAdminRoleActions.addAction(ActionType::indexStats);
         dbAdminRoleActions.addAction(ActionType::profileEnable);
         dbAdminRoleActions.addAction(ActionType::profileRead);
@@ -139,59 +140,58 @@ namespace {
         dbAdminRoleActions.addAction(ActionType::storageDetails);
         dbAdminRoleActions.addAction(ActionType::validate);
 
-        // Server admin role
-        serverAdminRoleReadActions.addAction(ActionType::connPoolStats);
-        serverAdminRoleReadActions.addAction(ActionType::connPoolSync);
-        serverAdminRoleReadActions.addAction(ActionType::getCmdLineOpts);
-        serverAdminRoleReadActions.addAction(ActionType::getLog);
-        serverAdminRoleReadActions.addAction(ActionType::getParameter);
-        serverAdminRoleReadActions.addAction(ActionType::getShardMap);
-        serverAdminRoleReadActions.addAction(ActionType::hostInfo);
-        serverAdminRoleReadActions.addAction(ActionType::listDatabases);
-        serverAdminRoleReadActions.addAction(ActionType::logRotate);
-        serverAdminRoleReadActions.addAction(ActionType::replSetFreeze);
-        serverAdminRoleReadActions.addAction(ActionType::replSetGetStatus);
-        serverAdminRoleReadActions.addAction(ActionType::replSetMaintenance);
-        serverAdminRoleReadActions.addAction(ActionType::replSetStepDown);
-        serverAdminRoleReadActions.addAction(ActionType::replSetSyncFrom);
-        serverAdminRoleReadActions.addAction(ActionType::setParameter);
-        serverAdminRoleReadActions.addAction(ActionType::serverStatus);
-        serverAdminRoleReadActions.addAction(ActionType::shutdown);
-        serverAdminRoleReadActions.addAction(ActionType::top);
-        serverAdminRoleReadActions.addAction(ActionType::touch);
-        serverAdminRoleReadActions.addAction(ActionType::unlock);
-
-        serverAdminRoleWriteActions.addAction(ActionType::applyOps);
-        serverAdminRoleWriteActions.addAction(ActionType::closeAllDatabases);
-        serverAdminRoleWriteActions.addAction(ActionType::cpuProfiler);
-        serverAdminRoleWriteActions.addAction(ActionType::cursorInfo);
-        serverAdminRoleWriteActions.addAction(ActionType::diagLogging);
-        serverAdminRoleWriteActions.addAction(ActionType::fsync);
-        serverAdminRoleWriteActions.addAction(ActionType::inprog);
-        serverAdminRoleWriteActions.addAction(ActionType::killop);
-        serverAdminRoleWriteActions.addAction(ActionType::repairDatabase);
-        serverAdminRoleWriteActions.addAction(ActionType::replSetInitiate);
-        serverAdminRoleWriteActions.addAction(ActionType::replSetReconfig);
-        serverAdminRoleWriteActions.addAction(ActionType::resync);
-
-        serverAdminRoleActions.addAllActionsFromSet(serverAdminRoleReadActions);
-        serverAdminRoleActions.addAllActionsFromSet(serverAdminRoleWriteActions);
+        // We separate clusterAdmin read-only and read-write actions for backwards
+        // compatibility with old-style read-only admin users.  This separation is not exposed to
+        // the user, and could go away once we stop supporting old-style privilege documents.
+        ActionSet clusterAdminRoleReadActions;
+        ActionSet clusterAdminRoleWriteActions;
 
         // Cluster admin role
+        clusterAdminRoleReadActions.addAction(ActionType::connPoolStats);
+        clusterAdminRoleReadActions.addAction(ActionType::connPoolSync);
+        clusterAdminRoleReadActions.addAction(ActionType::getCmdLineOpts);
+        clusterAdminRoleReadActions.addAction(ActionType::getLog);
+        clusterAdminRoleReadActions.addAction(ActionType::getParameter);
+        clusterAdminRoleReadActions.addAction(ActionType::getShardMap);
         clusterAdminRoleReadActions.addAction(ActionType::getShardVersion);
+        clusterAdminRoleReadActions.addAction(ActionType::hostInfo);
+        clusterAdminRoleReadActions.addAction(ActionType::listDatabases);
         clusterAdminRoleReadActions.addAction(ActionType::listShards);
+        clusterAdminRoleReadActions.addAction(ActionType::logRotate);
         clusterAdminRoleReadActions.addAction(ActionType::netstat);
+        clusterAdminRoleReadActions.addAction(ActionType::replSetFreeze);
+        clusterAdminRoleReadActions.addAction(ActionType::replSetGetStatus);
+        clusterAdminRoleReadActions.addAction(ActionType::replSetMaintenance);
+        clusterAdminRoleReadActions.addAction(ActionType::replSetStepDown);
+        clusterAdminRoleReadActions.addAction(ActionType::replSetSyncFrom);
+        clusterAdminRoleReadActions.addAction(ActionType::setParameter);
         clusterAdminRoleReadActions.addAction(ActionType::setShardVersion); // TODO: should this be internal?
+        clusterAdminRoleReadActions.addAction(ActionType::serverStatus);
         clusterAdminRoleReadActions.addAction(ActionType::splitVector);
+        clusterAdminRoleReadActions.addAction(ActionType::shutdown);
+        clusterAdminRoleReadActions.addAction(ActionType::top);
+        clusterAdminRoleReadActions.addAction(ActionType::touch);
+        clusterAdminRoleReadActions.addAction(ActionType::unlock);
         clusterAdminRoleReadActions.addAction(ActionType::unsetSharding);
 
         clusterAdminRoleWriteActions.addAction(ActionType::addShard);
+        clusterAdminRoleWriteActions.addAction(ActionType::closeAllDatabases);
+        clusterAdminRoleWriteActions.addAction(ActionType::cpuProfiler);
+        clusterAdminRoleWriteActions.addAction(ActionType::cursorInfo);
+        clusterAdminRoleWriteActions.addAction(ActionType::diagLogging);
         clusterAdminRoleWriteActions.addAction(ActionType::dropDatabase); // TODO: Should there be a CREATE_DATABASE also?
         clusterAdminRoleWriteActions.addAction(ActionType::enableSharding);
         clusterAdminRoleWriteActions.addAction(ActionType::flushRouterConfig);
+        clusterAdminRoleWriteActions.addAction(ActionType::fsync);
+        clusterAdminRoleWriteActions.addAction(ActionType::inprog);
+        clusterAdminRoleWriteActions.addAction(ActionType::killop);
         clusterAdminRoleWriteActions.addAction(ActionType::moveChunk);
         clusterAdminRoleWriteActions.addAction(ActionType::movePrimary);
         clusterAdminRoleWriteActions.addAction(ActionType::removeShard);
+        clusterAdminRoleWriteActions.addAction(ActionType::repairDatabase);
+        clusterAdminRoleWriteActions.addAction(ActionType::replSetInitiate);
+        clusterAdminRoleWriteActions.addAction(ActionType::replSetReconfig);
+        clusterAdminRoleWriteActions.addAction(ActionType::resync);
         clusterAdminRoleWriteActions.addAction(ActionType::shardCollection);
         clusterAdminRoleWriteActions.addAction(ActionType::shardingState);
         clusterAdminRoleWriteActions.addAction(ActionType::split);
@@ -199,6 +199,25 @@ namespace {
 
         clusterAdminRoleActions.addAllActionsFromSet(clusterAdminRoleReadActions);
         clusterAdminRoleActions.addAllActionsFromSet(clusterAdminRoleWriteActions);
+        clusterAdminRoleActions.addAction(ActionType::killCursors);
+
+        // Old-style user actions, for backwards compatibility
+        compatibilityReadOnlyActions.addAllActionsFromSet(readRoleActions);
+
+        compatibilityReadWriteActions.addAllActionsFromSet(readWriteRoleActions);
+        compatibilityReadWriteActions.addAllActionsFromSet(dbAdminRoleActions);
+        compatibilityReadWriteActions.addAllActionsFromSet(userAdminRoleActions);
+        compatibilityReadWriteActions.addAction(ActionType::clone);
+        compatibilityReadWriteActions.addAction(ActionType::copyDBTarget);
+        compatibilityReadWriteActions.addAction(ActionType::dropDatabase);
+        compatibilityReadWriteActions.addAction(ActionType::repairDatabase);
+
+        compatibilityReadOnlyAdminActions.addAllActionsFromSet(compatibilityReadOnlyActions);
+        compatibilityReadOnlyAdminActions.addAllActionsFromSet(clusterAdminRoleReadActions);
+
+        compatibilityReadWriteAdminActions.addAllActionsFromSet(compatibilityReadWriteActions);
+        compatibilityReadWriteAdminActions.addAllActionsFromSet(compatibilityReadOnlyAdminActions);
+        compatibilityReadWriteAdminActions.addAllActionsFromSet(clusterAdminRoleWriteActions);
 
         // Internal commands
         internalActions.addAction(ActionType::clone);
@@ -359,7 +378,6 @@ namespace {
         allActions.addAllActionsFromSet(readWriteRoleActions);
         allActions.addAllActionsFromSet(userAdminRoleActions);
         allActions.addAllActionsFromSet(dbAdminRoleActions);
-        allActions.addAllActionsFromSet(serverAdminRoleActions);
         allActions.addAllActionsFromSet(clusterAdminRoleActions);
         return allActions;
     }
@@ -369,6 +387,10 @@ namespace {
     }
 
     void AuthorizationManager::addAuthorizedPrincipal(Principal* principal) {
+
+        // Log out any already-logged-in user on the same database as "principal".
+        logoutDatabase(principal->getName().getDB().toString());  // See SERVER-8144.
+
         _authenticatedPrincipals.add(principal);
         if (!principal->isImplicitPrivilegeAcquisitionEnabled())
             return;
@@ -443,28 +465,19 @@ namespace {
 
     ActionSet AuthorizationManager::getActionsForOldStyleUser(const std::string& dbname,
                                                               bool readOnly) {
-        ActionSet actions;
-        // Basic actions
-        if (readOnly) {
-            actions.addAllActionsFromSet(readRoleActions);
-        }
-        else {
-            actions.addAllActionsFromSet(readWriteRoleActions);
-            actions.addAllActionsFromSet(dbAdminRoleActions);
-            actions.addAllActionsFromSet(userAdminRoleActions);
-            actions.addAction(ActionType::dropDatabase);
-            actions.addAction(ActionType::repairDatabase);
-        }
-        // Admin actions
         if (dbname == ADMIN_DBNAME || dbname == LOCAL_DBNAME) {
-            actions.addAllActionsFromSet(serverAdminRoleReadActions);
-            actions.addAllActionsFromSet(clusterAdminRoleReadActions);
-            if (!readOnly) {
-                actions.addAllActionsFromSet(serverAdminRoleWriteActions);
-                actions.addAllActionsFromSet(clusterAdminRoleWriteActions);
+            if (readOnly) {
+                return compatibilityReadOnlyAdminActions;
+            } else {
+                return compatibilityReadWriteAdminActions;
+            }
+        } else {
+            if (readOnly) {
+                return compatibilityReadOnlyActions;
+            } else {
+                return compatibilityReadWriteActions;
             }
         }
-        return actions;
     }
 
     Status AuthorizationManager::acquirePrivilegesFromPrivilegeDocument(
@@ -548,9 +561,9 @@ namespace {
      *
      * Returns non-OK status if "role" is not a defined role in "dbname".
      */
-    static Status _addPrivilegesForSystemRole(const std::string& dbname,
-                                              const std::string& role,
-                                              std::vector<Privilege>* outPrivileges) {
+    static void _addPrivilegesForSystemRole(const std::string& dbname,
+                                            const std::string& role,
+                                            std::vector<Privilege>* outPrivileges) {
         const bool isAdminDB = (dbname == ADMIN_DBNAME);
 
         if (role == SYSTEM_ROLE_READ) {
@@ -580,20 +593,14 @@ namespace {
             outPrivileges->push_back(
                     Privilege(PrivilegeSet::WILDCARD_RESOURCE, dbAdminRoleActions));
         }
-        else if (isAdminDB && role == SYSTEM_ROLE_SERVER_ADMIN) {
-            outPrivileges->push_back(
-                    Privilege(PrivilegeSet::WILDCARD_RESOURCE, serverAdminRoleActions));
-        }
         else if (isAdminDB && role == SYSTEM_ROLE_CLUSTER_ADMIN) {
             outPrivileges->push_back(
                     Privilege(PrivilegeSet::WILDCARD_RESOURCE, clusterAdminRoleActions));
         }
         else {
-            return Status(ErrorCodes::BadValue,
-                          mongoutils::str::stream() <<"No such role, " << role <<
-                          ", in database " << dbname);
+            warning() << "No such role, \"" << role << "\", in database " << dbname <<
+                    ". No privileges will be acquired from this role" << endl;
         }
-        return Status::OK();
     }
 
     /**
@@ -621,9 +628,7 @@ namespace {
             BSONElement roleElement = *iter;
             if (roleElement.type() != String)
                 return Status(ErrorCodes::TypeMismatch, privilegesTypeMismatchMessage);
-            Status status = _addPrivilegesForSystemRole(dbname, roleElement.str(), outPrivileges);
-            if (!status.isOK())
-                return status;
+            _addPrivilegesForSystemRole(dbname, roleElement.str(), outPrivileges);
         }
         return Status::OK();
     }
@@ -758,9 +763,12 @@ namespace {
             newActions.removeAction(ActionType::update);
             newActions.removeAction(ActionType::remove);
             newActions.addAction(ActionType::userAdmin);
-        } else if (collectionName == "system.profle" && newActions.contains(ActionType::find)) {
+        } else if (collectionName == "system.profile") {
             newActions.removeAction(ActionType::find);
             newActions.addAction(ActionType::profileRead);
+        } else if (collectionName == "system.indexes" && newActions.contains(ActionType::find)) {
+            newActions.removeAction(ActionType::find);
+            newActions.addAction(ActionType::indexRead);
         }
 
         return Privilege(privilege.getResource(), newActions);
