@@ -357,8 +357,11 @@ def skipTest(path):
     parentPath = os.path.dirname(path)
     parentDir = os.path.basename(parentPath)
     if small_oplog: # For tests running in parallel
-        if basename in ["cursor8.js", "indexh.js", "dropdb.js", "connections_opened.js"]:
+        if basename in ["cursor8.js", "indexh.js", "dropdb.js", "connections_opened.js", "opcounters.js"]:
             return True
+        if os.sys.platform == "sunos5":
+            if basename == "geo_update_btree.js":
+                return True
     if auth or keyFile: # For tests running with auth
         # Skip any tests that run with auth explicitly
         if parentDir == "auth" or "auth" in basename:
@@ -372,18 +375,13 @@ def skipTest(path):
         if parentDir == "disk": # SERVER-7356
             return True
 
-        authTestsToSkip = [("sharding", "gle_with_conf_servers.js"), # SERVER-6972
-                           ("sharding", "read_pref.js"), # SERVER-6972
-                           ("sharding", "read_pref_cmd.js"), # SERVER-6972
-                           ("sharding", "read_pref_rs_client.js"), # SERVER-6972
-                           ("sharding", "sync_conn_cmd.js"), #SERVER-6327
+        authTestsToSkip = [("jstests", "drop2.js"), # SERVER-8589,
                            ("sharding", "sync3.js"), # SERVER-6388 for this and those below
                            ("sharding", "sync6.js"),
                            ("sharding", "parallel.js"),
                            ("jstests", "bench_test1.js"),
                            ("jstests", "bench_test2.js"),
                            ("jstests", "bench_test3.js"),
-                           ("jstests", "drop2.js") # SERVER-8589
                            ]
 
         if os.path.join(parentDir,basename) in [ os.path.join(*test) for test in authTestsToSkip ]:
@@ -462,7 +460,8 @@ def runTest(test):
                      'TestData.noJournalPrealloc = ' + ternary( no_preallocj )  + ";" + \
                      'TestData.auth = ' + ternary( auth ) + ";" + \
                      'TestData.keyFile = ' + ternary( keyFile , '"' + str(keyFile) + '"' , 'null' ) + ";" + \
-                     'TestData.keyFileData = ' + ternary( keyFile , '"' + str(keyFileData) + '"' , 'null' ) + ";"
+                     'TestData.keyFileData = ' + ternary( keyFile , '"' + str(keyFileData) + '"' , 'null' ) + ";" + \
+                     'TestData.authMechanism = ' + ternary( authMechanism, '"' + str(authMechanism) + '"', 'null') + ";"
         if os.sys.platform == "win32":
             # double quotes in the evalString on windows; this
             # prevents the backslashes from being removed when

@@ -130,7 +130,7 @@ namespace mongo {
         string key = toSTLString(name);
         BSONHolder* holder = unwrapHolder(info.Holder());
         holder->_removed.erase(key);
-        holder->_extra.push_back(key);
+        holder->_extra.insert(key);
         holder->_modified = true;
 
         // set into JS object
@@ -159,7 +159,7 @@ namespace mongo {
             arr->Set(i, name);
         }
 
-        for (list<string>::iterator it = holder->_extra.begin();
+        for (set<string>::iterator it = holder->_extra.begin();
              it != holder->_extra.end(); it++) {
             string sname = *it;
             if (added.count(sname))
@@ -174,7 +174,7 @@ namespace mongo {
         string key = toSTLString(name);
         BSONHolder* holder = unwrapHolder(info.Holder());
         holder->_removed.insert(key);
-        holder->_extra.remove(key);
+        holder->_extra.erase(key);
         holder->_modified = true;
 
         // also delete in JS obj
@@ -226,7 +226,7 @@ namespace mongo {
         string key = str::stream() << index;
         BSONHolder* holder = unwrapHolder(info.Holder());
         holder->_removed.insert(key);
-        holder->_extra.remove(key);
+        holder->_extra.erase(key);
         holder->_modified = true;
 
         // also delete in JS obj
@@ -265,7 +265,7 @@ namespace mongo {
         string key = str::stream() << index;
         BSONHolder* holder = unwrapHolder(info.Holder());
         holder->_removed.erase(key);
-        holder->_extra.push_back(key);
+        holder->_extra.insert(key);
         holder->_modified = true;
 
         // set into JS object
@@ -298,6 +298,15 @@ namespace mongo {
         return v8::Boolean::New(false);
     }
 
+    /**
+     * GC Prologue and Epilogue constants (used to display description constants)
+     */
+    struct GCPrologueState { static const char* name; };
+    const char* GCPrologueState::name = "prologue";
+    struct GCEpilogueState { static const char* name; };
+    const char* GCEpilogueState::name = "epilogue";
+
+    template <typename _GCState>
     void gcCallback(v8::GCType type, v8::GCCallbackFlags flags) {
         const int verbosity = 1;    // log level for stat collection
         if (logLevel < verbosity)
@@ -306,12 +315,13 @@ namespace mongo {
 
         v8::HeapStatistics stats;
         v8::V8::GetHeapStatistics(&stats);
-        LOG(verbosity) << "V8 GC heap stats - "
-                << " total: " << stats.total_heap_size()
-                << " exec: " << stats.total_heap_size_executable()
-                << " used: " << stats.used_heap_size()<< " limit: "
-                << stats.heap_size_limit()
-                << endl;
+        log() << "V8 GC " << _GCState::name
+              << " heap stats - "
+              << " total: " << stats.total_heap_size()
+              << " exec: " << stats.total_heap_size_executable()
+              << " used: " << stats.used_heap_size()<< " limit: "
+              << stats.heap_size_limit()
+              << endl;
     }
 
     V8ScriptEngine::V8ScriptEngine() :
@@ -455,12 +465,6 @@ namespace mongo {
         _isolate = v8::Isolate::New();
         v8::Isolate::Scope iscope(_isolate);
 
-        // resource constraints must be set on isolate, before any call or lock
-        v8::ResourceConstraints rc;
-        rc.set_max_young_space_size(4 * 1024 * 1024);
-        rc.set_max_old_space_size(64 * 1024 * 1024);
-        v8::SetResourceConstraints(&rc);
-
         // lock the isolate and enter the context
         v8::Locker l(_isolate);
         v8::HandleScope handleScope;
@@ -468,7 +472,8 @@ namespace mongo {
         v8::Context::Scope context_scope(_context);
 
         // display heap statistics on MarkAndSweep GC run
-        v8::V8::AddGCPrologueCallback(gcCallback, v8::kGCTypeMarkSweepCompact);
+        v8::V8::AddGCPrologueCallback(gcCallback<GCPrologueState>, v8::kGCTypeMarkSweepCompact);
+        v8::V8::AddGCEpilogueCallback(gcCallback<GCEpilogueState>, v8::kGCTypeMarkSweepCompact);
 
         // if the isolate runs out of heap space, raise a flag on the StackGuard instead of
         // calling abort()
@@ -659,9 +664,9 @@ namespace mongo {
         _global->ForceSet(v8StringData(field), v8::Number::New(val));
     }
 
-    void V8Scope::setString(const char * field, const char * val) {
+    void V8Scope::setString(const char * field, const StringData& val) {
         V8_SIMPLE_HEADER
-        _global->ForceSet(v8StringData(field), v8::String::New(val));
+        _global->ForceSet(v8StringData(field), v8::String::New(val.rawData(), val.size()));
     }
 
     void V8Scope::setBoolean(const char * field, bool val) {
@@ -897,8 +902,9 @@ namespace mongo {
         string fn = str::stream() << "_funcs" << functionNumber;
         code = str::stream() << fn << " = " << code;
 
-        v8::Handle<v8::Script> script = v8::Script::Compile(v8::String::New(code.c_str()),
-                                        v8::String::New(fn.c_str()));
+        v8::Handle<v8::Script> script = v8::Script::Compile(
+                                            v8::String::New(code.c_str(), code.length()),
+                                            v8::String::New(fn.c_str()));
 
         // throw on error
         checkV8ErrorState(script, try_catch);
@@ -1012,7 +1018,7 @@ namespace mongo {
 
         v8::Handle<v8::Script> script =
                 v8::Script::Compile(v8::String::New(code.rawData(), code.size()),
-                                    v8::String::New(name.c_str()));
+                                    v8::String::New(name.c_str(), name.length()));
 
         if (checkV8ErrorState(script, try_catch, reportError, assertOnError))
             return false;
@@ -1224,12 +1230,13 @@ namespace mongo {
         registerOpId();
     }
 
-    v8::Local<v8::Value> V8Scope::newFunction(const char *code) {
+    v8::Local<v8::Value> V8Scope::newFunction(const StringData& code) {
         v8::HandleScope handle_scope;
         v8::TryCatch try_catch;
         string codeStr = str::stream() << "____MongoToV8_newFunction_temp = " << code;
 
-        v8::Local<v8::Script> compiled = v8::Script::New(v8::String::New(codeStr.c_str()));
+        v8::Local<v8::Script> compiled = v8::Script::New(v8::String::New(codeStr.c_str(),
+                                                                         codeStr.length()));
 
         // throw on compile error
         checkV8ErrorState(compiled, try_catch);
@@ -1246,7 +1253,8 @@ namespace mongo {
         v8::HandleScope handle_scope;
         v8::Function* idCons = this->getObjectIdCons();
         v8::Handle<v8::Value> argv[1];
-        argv[0] = v8::String::New(id.str().c_str());
+        const string& idString = id.str();
+        argv[0] = v8::String::New(idString.c_str(), idString.length());
         return handle_scope.Close(idCons->NewInstance(1, argv));
     }
 
@@ -1311,19 +1319,21 @@ namespace mongo {
 
             switch (f.type()) {
             case mongo::Code:
-                o->ForceSet(name, newFunction(f.valuestr()));
+                o->ForceSet(name, newFunction(StringData(f.valuestr(), f.valuestrsize() - 1)));
                 break;
             case CodeWScope:
                 if (!f.codeWScopeObject().isEmpty())
                     log() << "warning: CodeWScope doesn't transfer to db.eval" << endl;
-                o->ForceSet(name, newFunction(f.codeWScopeCode()));
+                o->ForceSet(name, newFunction(StringData(f.codeWScopeCode(), f.codeWScopeCodeLen() - 1)));
                 break;
+            case mongo::Symbol:
             case mongo::String:
-                o->ForceSet(name, v8::String::New(f.valuestr()));
+                o->ForceSet(name, v8::String::New(f.valuestr(), f.valuestrsize() - 1));
                 break;
             case mongo::jstOID: {
                 v8::Function * idCons = getObjectIdCons();
-                argv[0] = v8::String::New(f.__oid().str().c_str());
+                const string& oidString = f.__oid().str();
+                argv[0] = v8::String::New(oidString.c_str(), oidString.length());
                 o->ForceSet(name, idCons->NewInstance(1, argv));
                 break;
             }
@@ -1514,13 +1524,14 @@ namespace mongo {
 
         switch (elem.type()) {
         case mongo::Code:
-            return newFunction(elem.valuestr());
+            return newFunction(StringData(elem.valuestr(), elem.valuestrsize() - 1));
         case CodeWScope:
             if (!elem.codeWScopeObject().isEmpty())
                 log() << "warning: CodeWScope doesn't transfer to db.eval" << endl;
-            return newFunction(elem.codeWScopeCode());
+            return newFunction(StringData(elem.codeWScopeCode(), elem.codeWScopeCodeLen() - 1));
+        case mongo::Symbol:
         case mongo::String:
-            return v8::String::New(elem.valuestr());
+            return v8::String::New(elem.valuestr(), elem.valuestrsize() - 1);
         case mongo::jstOID:
             return newId(elem.__oid());
         case mongo::NumberDouble:
@@ -1633,7 +1644,8 @@ namespace mongo {
     void V8Scope::v8ToMongoInternal(BSONObjBuilder& b,
                                     const string& elementName,
                                     v8::Handle<v8::Object> obj) {
-        uint32_t bsonType = obj->GetInternalField(0)->ToUint32()->Value();
+        uint32_t bsonTypeRaw = obj->GetInternalField(0)->ToUint32()->Value();
+        BSONType bsonType = static_cast<BSONType>(bsonTypeRaw);
         switch(bsonType) {
         case Timestamp:
             b.appendTimestamp(elementName,
@@ -1795,7 +1807,7 @@ namespace mongo {
             }
         }
 
-        v8::Local<v8::Array> names = o->GetPropertyNames();
+        v8::Local<v8::Array> names = o->GetOwnPropertyNames();
         for (unsigned int i=0; i<names->Length(); i++) {
             v8::Local<v8::String> name = names->Get(i)->ToString();
             v8::Local<v8::Value> value = o->Get(name);

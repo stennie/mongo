@@ -19,6 +19,7 @@
 #include "mongo/client/connpool.h"
 #include "mongo/db/namespacestring.h"
 #include "mongo/s/cluster_client_internal.h"
+#include "mongo/util/timer.h"
 
 namespace mongo {
 
@@ -30,7 +31,7 @@ namespace mongo {
         auto_ptr<DBClientCursor> cursor;
 
         try {
-            connPtr.reset(ScopedDbConnection::getInternalScopedDbConnection(configLoc, 30));
+            connPtr.reset(new ScopedDbConnection(configLoc, 30));
             ScopedDbConnection& conn = *connPtr;
 
             scoped_ptr<DBClientCursor> cursorA(_safeCursor(conn->query(nsA,
@@ -88,23 +89,18 @@ namespace mongo {
         // Check the sizes first, b/c if one collection is empty the hash check will fail
         //
 
-        scoped_ptr<ScopedDbConnection> connPtr;
-
         unsigned long long countA;
         unsigned long long countB;
 
         try {
-            connPtr.reset(ScopedDbConnection::getInternalScopedDbConnection(configLoc, 30));
-            ScopedDbConnection& conn = *connPtr;
-
+            ScopedDbConnection conn(configLoc, 30);
             countA = conn->count(nsA, BSONObj());
             countB = conn->count(nsB, BSONObj());
+            conn.done();
         }
         catch (const DBException& e) {
             return e.toStatus();
         }
-
-        connPtr->done();
 
         if (countA == 0 && countB == 0) {
             return Status::OK();
@@ -126,16 +122,13 @@ namespace mongo {
         NamespaceString nssA(nsA);
 
         try {
-            connPtr.reset(ScopedDbConnection::getInternalScopedDbConnection(configLoc, 30));
-            ScopedDbConnection& conn = *connPtr;
-
+            ScopedDbConnection conn(configLoc, 30);
             resultOk = conn->runCommand(nssA.db, BSON("dbHash" << true), result);
+            conn.done();
         }
         catch (const DBException& e) {
             return e.toStatus();
         }
-
-        connPtr->done();
 
         if (!resultOk) {
             return Status(ErrorCodes::UnknownError,
@@ -158,16 +151,13 @@ namespace mongo {
         NamespaceString nssB(nsB);
 
         try {
-            connPtr.reset(ScopedDbConnection::getInternalScopedDbConnection(configLoc, 30));
-            ScopedDbConnection& conn = *connPtr;
-
+            ScopedDbConnection conn(configLoc, 30);
             resultOk = conn->runCommand(nssB.db, BSON("dbHash" << true), result);
+            conn.done();
         }
         catch (const DBException& e) {
             return e.toStatus();
         }
-
-        connPtr->done();
 
         if (!resultOk) {
             return Status(ErrorCodes::UnknownError,
@@ -204,7 +194,7 @@ namespace mongo {
         BSONObj createResult;
 
         try {
-            connPtr.reset(ScopedDbConnection::getInternalScopedDbConnection(configLoc, 30));
+            connPtr.reset(new ScopedDbConnection(configLoc, 30));
             ScopedDbConnection& conn = *connPtr;
 
             resultOk = conn->createCollection(toNS, 0, false, 0, &createResult);
@@ -249,16 +239,45 @@ namespace mongo {
             return e.toStatus("could not create indexes in new collection");
         }
 
-        // Copy data over
+        //
+        // Copy data over in batches. A batch size here is way smaller than the maximum size of
+        // a bsonobj. We want to copy efficiently but we don't need to maximize the object size
+        // here.
+        //
+
+        Timer t;
+        int64_t docCount = 0;
+        const int32_t maxBatchSize = BSONObjMaxUserSize / 2;
         try {
             ScopedDbConnection& conn = *connPtr;
             scoped_ptr<DBClientCursor> cursor(_safeCursor(conn->query(fromNS, BSONObj())));
 
+            vector<BSONObj> insertBatch;
+            int32_t insertSize = 0;
             while (cursor->more()) {
 
                 BSONObj next = cursor->nextSafe();
+                ++docCount;
 
-                conn->insert(toNS, next);
+                if (insertSize + next.objsize() > maxBatchSize ) {
+                    conn->insert(toNS, insertBatch);
+                    _checkGLE(conn);
+                    insertBatch.clear();
+                    insertSize = 0;
+                }
+
+                insertBatch.push_back(next);
+                insertSize += next.objsize();
+
+                if (t.seconds() > 10) {
+                    t.reset();
+                    log() << "Copied " << docCount << " documents so far from "
+                          << fromNS << " to " << toNS;
+                }
+            }
+
+            if (!insertBatch.empty()) {
+                conn->insert(toNS, insertBatch);
                 _checkGLE(conn);
             }
         }
@@ -285,7 +304,6 @@ namespace mongo {
                                const string& fromNS,
                                const string& overwriteNS)
     {
-        scoped_ptr<ScopedDbConnection> connPtr;
 
         // TODO: Also a bit awkward to deal with command results
         bool resultOk;
@@ -293,8 +311,7 @@ namespace mongo {
 
         // Create new collection
         try {
-            connPtr.reset(ScopedDbConnection::getInternalScopedDbConnection(configLoc, 30));
-            ScopedDbConnection& conn = *connPtr;
+            ScopedDbConnection conn(configLoc, 30);
 
             BSONObjBuilder bob;
             bob.append("renameCollection", fromNS);
@@ -303,12 +320,11 @@ namespace mongo {
             BSONObj renameCommand = bob.obj();
 
             resultOk = conn->runCommand("admin", renameCommand, renameResult);
+            conn.done();
         }
         catch (const DBException& e) {
             return e.toStatus();
         }
-
-        connPtr->done();
 
         if (!resultOk) {
             return Status(ErrorCodes::UnknownError,

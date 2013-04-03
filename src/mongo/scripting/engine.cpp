@@ -26,6 +26,7 @@
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/scripting/bench.h"
 #include "mongo/util/file.h"
+#include "mongo/util/text.h"
 
 namespace mongo {
     long long Scope::_lastVersion = 1;
@@ -94,8 +95,11 @@ namespace mongo {
 
     bool Scope::execFile(const string& filename, bool printResult, bool reportError,
                          int timeoutMs) {
-
+#ifdef _WIN32
+        boost::filesystem::path p(toWideString(filename.c_str()));
+#else
         boost::filesystem::path p(filename);
+#endif
         if (!exists(p)) {
             log() << "file [" << filename << "] doesn't exist" << endl;
             return false;
@@ -111,7 +115,7 @@ namespace mongo {
                 boost::filesystem::path sub(*it);
                 if (!endsWith(sub.string().c_str(), ".js"))
                     continue;
-                if (!execFile(sub.string().c_str(), printResult, reportError, timeoutMs))
+                if (!execFile(sub.string(), printResult, reportError, timeoutMs))
                     return false;
             }
 
@@ -219,16 +223,16 @@ namespace mongo {
             }
         }
 
-        map<string, ScriptingFunction>::iterator i = _cachedFunctions.find(code);
+        FunctionCacheMap::iterator i = _cachedFunctions.find(code);
         if (i != _cachedFunctions.end())
             return i->second;
         // NB: we calculate the function number for v8 so the cache can be utilized to
         //     lookup the source on an exception, but SpiderMonkey uses the value
         //     returned by JS_CompileFunction.
-        ScriptingFunction functionNumber = getFunctionCache().size() + 1;
-        _cachedFunctions[code] = functionNumber;
-        ScriptingFunction f = _createFunction(code, functionNumber);
-        return f;
+        ScriptingFunction defaultFunctionNumber = getFunctionCache().size() + 1;
+        ScriptingFunction& actualFunctionNumber = _cachedFunctions[code];
+        actualFunctionNumber = _createFunction(code, defaultFunctionNumber);
+        return actualFunctionNumber;
     }
 
     namespace JSFiles {
@@ -363,7 +367,7 @@ namespace mongo {
         bool getBoolean(const char* field) { return _real->getBoolean(field); }
         BSONObj getObject(const char* field) { return _real->getObject(field); }
         void setNumber(const char* field, double val) { _real->setNumber(field, val); }
-        void setString(const char* field, const char* val) { _real->setString(field, val); }
+        void setString(const char* field, const StringData& val) { _real->setString(field, val); }
         void setElement(const char* field, const BSONElement& val) {
             _real->setElement(field, val);
         }
@@ -439,8 +443,24 @@ namespace mongo {
         if (x == string::npos)
             return false;
 
-        return (x == 0 || !isalpha(code[x-1])) &&
-               !isalpha(code[x+6]);
+        int quoteCount = 0;
+        int singleQuoteCount = 0;
+        for (size_t i = 0; i < x; i++) {
+            if (code[i] == '"') {
+                quoteCount++;
+            } else if(code[i] == '\'') {
+                singleQuoteCount++;
+            }
+        }
+        // if we are in either single quotes or double quotes return false
+        if (quoteCount % 2 != 0 || singleQuoteCount % 2 != 0) {
+            return false;
+        }
+
+        // return is at start OR preceded by space
+        // AND return is not followed by digit or letter
+        return (x == 0 || isspace(code[x-1])) &&
+               !(isalpha(code[x+6]) || isdigit(code[x+6]));
     }
 
     const char* jsSkipWhiteSpace(const char* raw) {

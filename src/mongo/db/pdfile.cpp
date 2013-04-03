@@ -38,6 +38,7 @@ _ disallow system* manipulations from the database.
 #include "mongo/db/pdfile_private.h"
 #include "mongo/db/background.h"
 #include "mongo/db/btree.h"
+#include "mongo/db/cloner.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/curop-inl.h"
 #include "mongo/db/db.h"
@@ -51,9 +52,9 @@ _ disallow system* manipulations from the database.
 #include "mongo/db/namespace-inl.h"
 #include "mongo/db/namespacestring.h"
 #include "mongo/db/ops/delete.h"
-#include "mongo/db/repl.h"
 #include "mongo/db/replutil.h"
 #include "mongo/db/sort_phase_one.h"
+#include "mongo/db/repl/oplog.h"
 #include "mongo/util/file.h"
 #include "mongo/util/file_allocator.h"
 #include "mongo/util/hashtab.h"
@@ -449,10 +450,12 @@ namespace mongo {
         verify( sz % 4096 == 0 );
         if( sz < 64*1024*1024 && !cmdLine.smallfiles ) { 
             if( sz >= 16*1024*1024 && sz % (1024*1024) == 0 ) { 
-                log() << "info openExisting file size " << sz << " but cmdLine.smallfiles=false" << endl;
+                log() << "info openExisting file size " << sz << " but cmdLine.smallfiles=false: "
+                      << filename << endl;
             }
             else {
-                log() << "openExisting size " << sz << " less then minimum file size expectation " << filename << endl;
+                log() << "openExisting size " << sz << " less then minimum file size expectation "
+                      << filename << endl;
                 verify(false);
             }
         }

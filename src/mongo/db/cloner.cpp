@@ -25,12 +25,13 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/rename_collection.h"
 #include "mongo/db/db.h"
+#include "mongo/db/dbhelpers.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/kill_current_op.h"
 #include "mongo/db/namespacestring.h"
+#include "mongo/db/repl/oplog.h"
 #include "mongo/db/pdfile.h"
-#include "mongo/db/repl.h"
 #include "mongo/db/sort_phase_one.h"
 
 namespace mongo {
@@ -259,12 +260,16 @@ namespace mongo {
         }
     }
 
-    bool Cloner::validateQueryResults(const auto_ptr<DBClientCursor>& cur, int32_t* errCode) {
+    bool Cloner::validateQueryResults(const auto_ptr<DBClientCursor>& cur,
+                                      int32_t* errCode,
+                                      string& errmsg) {
         if ( cur.get() == 0 )
             return false;
         if ( cur->more() ) {
             BSONObj first = cur->next();
-            if(!getErrField(first).eoo()) {
+            BSONElement errField = getErrField(first);
+            if(!errField.eoo()) {
+                errmsg = errField.str();
                 if (errCode)
                     *errCode = first.getIntField("code");
                 return false;
@@ -389,11 +394,12 @@ namespace mongo {
             mayInterrupt( opts.mayBeInterrupted );
             dbtempreleaseif r( opts.mayYield );
 
+#if 0
             // fetch index info
             auto_ptr<DBClientCursor> cur = _conn->query(idxns.c_str(), BSONObj(), 0, 0, 0,
                                                        opts.slaveOk ? QueryOption_SlaveOk : 0 );
-            if (!validateQueryResults(cur, errCode)) {
-                errmsg = "index query failed " + ns;
+            if (!validateQueryResults(cur, errCode, errmsg)) {
+                errmsg = "index query on ns " + ns + " failed: " + errmsg;
                 return false;
             }
             while(cur->more()) {
@@ -415,7 +421,7 @@ namespace mongo {
                 _sortersForNS[idxEntry["ns"].String()].insert(make_pair(idxEntry["name"].String(),
                                                                         details));
             }
-
+#endif
             // just using exhaust for collection copying right now
             
             // todo: if snapshot (bool param to this func) is true, we need to snapshot this query?
@@ -426,8 +432,8 @@ namespace mongo {
             auto_ptr<DBClientCursor> cursor = _conn->query(ns.c_str(), BSONObj(), 0, 0, 0,
                                                       opts.slaveOk ? QueryOption_SlaveOk : 0);
 
-            if (!validateQueryResults(cursor, errCode)) {
-                errmsg = "namespace query failed " + ns;
+            if (!validateQueryResults(cursor, errCode, errmsg)) {
+                errmsg = "index query on ns " + ns + " failed: " + errmsg;
                 return false;
             }
 
@@ -761,7 +767,7 @@ namespace mongo {
             // source DB.
             ActionSet actions;
             actions.addAction(ActionType::copyDBTarget);
-            out->push_back(Privilege(dbname, actions));
+            out->push_back(Privilege(dbname, actions)); // NOTE: dbname is always admin
         }
         virtual void help( stringstream &help ) const {
             help << "copy a database from another host to this host\n";
@@ -804,6 +810,12 @@ namespace mongo {
                     }
                 }
                 cloner.setConnection( authConn_.release() );
+            } else {
+                DBClientConnection* conn = new DBClientConnection();
+                cloner.setConnection(conn);
+                if (!conn->connect(fromhost, errmsg)) {
+                    return false;
+                }
             }
             Client::Context ctx(todb);
             bool res = cloner.go(fromhost.c_str(), errmsg, fromdb, /*logForReplication=*/!fromRepl, slaveOk, /*replauth*/false, /*snapshot*/true, /*mayYield*/true, /*mayBeInterrupted*/ false);
@@ -820,7 +832,6 @@ namespace mongo {
         virtual bool adminOnly() const {
             return true;
         }
-        virtual bool requiresAuth() { return true; }
         virtual bool slaveOk() const {
             return false;
         }

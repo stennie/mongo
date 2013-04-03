@@ -20,10 +20,10 @@
 
 #include "mongo/db/commands.h"
 #include "mongo/db/instance.h"
-#include "mongo/db/repl.h"
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/connections.h"
 #include "mongo/db/repl/health.h"
+#include "mongo/db/repl/replication_server_status.h"  // replSettings
 #include "mongo/db/repl/rs.h"
 #include "mongo/util/background.h"
 #include "mongo/util/concurrency/msg.h"
@@ -38,7 +38,6 @@ namespace mongo {
     using namespace bson;
 
     extern bool replSetBlind;
-    extern ReplSettings replSettings;
 
     unsigned int HeartbeatInfo::numPings;
 
@@ -122,6 +121,11 @@ namespace mongo {
             result.append("hbmsg", theReplSet->hbmsg());
             result.append("time", (long long) time(0));
             result.appendDate("opTime", theReplSet->lastOpTimeWritten.asDate());
+            const Member *syncTarget = replset::BackgroundSync::get()->getSyncTarget();
+            if (syncTarget) {
+                result.append("syncingTo", syncTarget->fullName());
+            }
+
             int v = theReplSet->config().version;
             result.append("v", v);
             if( v > cmdObj["v"].Int() )
@@ -396,6 +400,10 @@ namespace mongo {
             }
             mem.health = 1.0;
             mem.lastHeartbeatMsg = info["hbmsg"].String();
+            if (info.hasElement("syncingTo")) {
+                mem.syncingTo = info["syncingTo"].String();
+            }
+
             if( info.hasElement("opTime") )
                 mem.opTime = info["opTime"].Date();
 

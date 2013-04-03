@@ -181,7 +181,7 @@ namespace mongo {
             if ( lockType > 0 ) { // write $cmd
                 string errmsg;
                 if ( ! prepare( errmsg ) )
-                    throw UserException( 13104 , (string)"SyncClusterConnection::findOne prepare failed: " + errmsg );
+                    throw UserException( PrepareConfigsFailedCode , (string)"SyncClusterConnection::findOne prepare failed: " + errmsg );
 
                 vector<BSONObj> all;
                 for ( size_t i=0; i<_conns.size(); i++ ) {
@@ -210,39 +210,39 @@ namespace mongo {
     }
 
     void SyncClusterConnection::_auth(const BSONObj& params) {
-        // A SCC is authorized if any connection has been authorized
+        // A SCC is authenticated if any connection has been authenticated
         // Credentials are stored in the auto-reconnect connections.
 
         bool authedOnce = false;
         vector<string> errors;
 
-        for( vector<DBClientConnection*>::iterator it = _conns.begin(); it < _conns.end(); ++it ){
+        for ( vector<DBClientConnection*>::iterator it = _conns.begin(); it < _conns.end(); ++it ) {
 
             massert( 15848, "sync cluster of sync clusters?",
                             (*it)->type() != ConnectionString::SYNC );
 
-            // Authorize or collect the error message
+            // Authenticate or collect the error message
             string lastErrmsg;
             bool authed;
-            try{
+            try {
                 // Auth errors can manifest either as exceptions or as false results
                 // TODO: Make this better
                 (*it)->auth(params);
                 authed = true;
             }
-            catch( const DBException& e ){
+            catch ( const DBException& e ) {
                 // auth will be retried on reconnect
                 lastErrmsg = e.what();
                 authed = false;
             }
 
-            if( ! authed ){
+            if ( ! authed ) {
 
                 // Since we're using auto-reconnect connections, we're sure the auth info has been
                 // stored if needed for later
 
                 lastErrmsg = str::stream() << "auth error on " << (*it)->getServerAddress()
-                                                               << causedBy( lastErrmsg );
+                                           << causedBy( lastErrmsg );
 
                 LOG(1) << lastErrmsg << endl;
                 errors.push_back( lastErrmsg );
@@ -336,7 +336,31 @@ namespace mongo {
             return;
         }
 
-        uassert( 10023 , "SyncClusterConnection bulk insert not implemented" , 0);
+        for (vector<BSONObj>::const_iterator it = v.begin(); it != v.end(); ++it ) {
+            BSONObj obj = *it;
+            if ( obj["_id"].type() == EOO ) {
+                string assertMsg = "SyncClusterConnection::insert (batched) obj misses an _id: ";
+                uasserted( 16743, assertMsg + obj.jsonString() );
+            }
+        }
+
+        // fsync all connections before starting the batch.
+        string errmsg;
+        if ( ! prepare( errmsg ) ) {
+            string assertMsg = "SyncClusterConnection::insert (batched) prepare failed: ";
+            throw UserException( 16744, assertMsg + errmsg );
+        }
+
+        // We still want one getlasterror per document, even if they're batched.
+        for ( size_t i=0; i<_conns.size(); i++ ) {
+            for ( vector<BSONObj>::const_iterator it = v.begin(); it != v.end(); ++it ) {
+                _conns[i]->insert( ns, *it, flags );
+                _conns[i]->getLastErrorDetailed();
+            }
+        }
+
+        // We issue a final getlasterror, but this time with an fsync.
+        _checkLast();
     }
 
     void SyncClusterConnection::remove( const string &ns , Query query, int flags ) {

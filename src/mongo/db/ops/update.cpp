@@ -16,15 +16,20 @@
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "pch.h"
+#include "mongo/pch.h"
 
-#include "mongo/db/oplog.h"
-#include "mongo/db/pagefault.h"
-#include "mongo/db/queryutil.h"
+#include "mongo/db/ops/update.h"
+
 #include "mongo/client/dbclientinterface.h"
-
-#include "update.h"
-#include "update_internal.h"
+#include "mongo/db/clientcursor.h"
+#include "mongo/db/namespace_details.h"
+#include "mongo/db/pagefault.h"
+#include "mongo/db/pdfile.h"
+#include "mongo/db/query_optimizer.h"
+#include "mongo/db/queryutil.h"
+#include "mongo/db/record.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/ops/update_internal.h"
 
 //#define DEBUGUPDATE(x) cout << x << endl;
 #define DEBUGUPDATE(x)
@@ -201,8 +206,7 @@ namespace mongo {
 
         int numModded = 0;
         debug.nscanned = 0;
-        shared_ptr<Cursor> c =
-            NamespaceDetailsTransient::getCursor( ns, patternOrig, BSONObj(), planPolicy );
+        shared_ptr<Cursor> c = getOptimizedCursor( ns, patternOrig, BSONObj(), planPolicy );
         d = nsdetails(ns);
         nsdt = &NamespaceDetailsTransient::get(ns);
         bool autoDedup = c->autoDedup();

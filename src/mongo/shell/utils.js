@@ -371,6 +371,7 @@ jsTestOptions = function(){
                               keyFile : TestData.keyFile,
                               authUser : "__system",
                               authPassword : TestData.keyFileData,
+                              authMechanism : TestData.authMechanism,
                               adminUser : TestData.adminUser || "admin",
                               adminPassword : TestData.adminPassword || "password" });
     }
@@ -777,17 +778,39 @@ shellHelper.show = function (what) {
 
     if (what == "dbs" || what == "databases") {
         var dbs = db.getMongo().getDBs();
-        var size = {};
-        dbs.databases.forEach(function (x) { size[x.name] = x.sizeOnDisk; });
-        var names = dbs.databases.map(function (z) { return z.name; }).sort();
-        names.forEach(function (n) {
-            if (size[n] > 1) {
-                print(n + "\t" + size[n] / 1024 / 1024 / 1024 + "GB");
+        var dbinfo = [];
+        var maxNameLength = 0;
+        var maxGbDigits = 0;
+
+        dbs.databases.forEach(function (x){
+            var sizeStr = (x.sizeOnDisk / 1024 / 1024 / 1024).toFixed(3);
+            var nameLength = x.name.length;
+            var gbDigits = sizeStr.indexOf(".");
+
+            if( nameLength > maxNameLength) maxNameLength = nameLength;
+            if( gbDigits > maxGbDigits ) maxGbDigits = gbDigits;
+
+            dbinfo.push({
+                name:      x.name,
+                size:      x.sizeOnDisk,
+                size_str:  sizeStr,
+                name_size: nameLength,
+                gb_digits: gbDigits
+            });
+        });
+
+        dbinfo.sort(function (a,b) { a.name - b.name });
+        dbinfo.forEach(function (db) {
+            var namePadding = maxNameLength - db.name_size;
+            var sizePadding = maxGbDigits   - db.gb_digits;
+            var padding = Array(namePadding + sizePadding + 3).join(" ");
+            if (db.size > 1) {
+                print(db.name + padding + db.size_str + "GB");
             } else {
-                print(n + "\t(empty)");
+                print(db.name + padding + "(empty)");
             }
         });
-        //db.getMongo().getDBNames().sort().forEach(function (x) { print(x) });
+
         return "";
     }
     
@@ -796,7 +819,11 @@ shellHelper.show = function (what) {
         if ( args.length > 0 )
             n = args[0]
         
-        var res = db.adminCommand( { getLog : n } )
+        var res = db.adminCommand( { getLog : n } );
+        if ( ! res.ok ) {
+            print("Error while trying to show " + n + " log: " + res.errmsg);
+            return "";
+        }
         for ( var i=0; i<res.log.length; i++){
             print( res.log[i] )
         }
@@ -805,6 +832,10 @@ shellHelper.show = function (what) {
 
     if (what == "logs" ) {
         var res = db.adminCommand( { getLog : "*" } )
+        if ( ! res.ok ) {
+            print("Error while trying to show logs: " + res.errmsg);
+            return "";
+        }
         for ( var i=0; i<res.names.length; i++){
             print( res.names[i] )
         }
@@ -883,6 +914,25 @@ Random.genExp = function( mean ) {
         }
     }
     return -Math.log( r ) * mean;
+}
+
+/**
+ * Generate a random value from the normal distribution with specified 'mean' and
+ * 'standardDeviation'.
+ */
+Random.genNormal = function( mean, standardDeviation ) {    
+
+    // See http://en.wikipedia.org/wiki/Marsaglia_polar_method
+    while ( true ) {
+        var x = ( 2 * Random.rand() ) - 1;
+        var y = ( 2 * Random.rand() ) - 1;
+        var s = ( x * x ) + ( y * y );
+
+        if ( s > 0 && s < 1 ) {
+            var standardNormal = x * Math.sqrt( -2 * Math.log( s ) / s );
+            return mean + ( standardDeviation * standardNormal );
+        }
+    }
 }
 
 Geo = {};

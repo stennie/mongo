@@ -35,6 +35,7 @@
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/background.h"
 #include "mongo/db/btreecursor.h"
+#include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/db.h"
@@ -48,10 +49,10 @@
 #include "mongo/db/lasterror.h"
 #include "mongo/db/ops/count.h"
 #include "mongo/db/pdfile.h"
-#include "mongo/db/queryoptimizer.h"
-#include "mongo/db/repl.h"
-#include "mongo/db/repl_block.h"
+#include "mongo/db/query_optimizer.h"
+#include "mongo/db/repl/write_concern.h"
 #include "mongo/db/replutil.h"
+#include "mongo/db/repl/oplog.h"
 #include "mongo/db/stats/timer_stats.h"
 #include "mongo/s/d_writeback.h"
 #include "mongo/s/stale_exception.h"  // for SendStaleConfigException
@@ -77,7 +78,6 @@ namespace mongo {
         virtual bool slaveOk() const {
             return true;
         }
-        virtual bool requiresAuth() { return false; }
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {} // No auth required
@@ -113,7 +113,6 @@ namespace mongo {
         virtual LockType locktype() const { return NONE;  }
         virtual bool logTheOp()           { return false; }
         virtual bool slaveOk() const      { return true;  }
-        virtual bool requiresAuth()       { return false; }
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {} // No auth required
@@ -187,7 +186,9 @@ namespace mongo {
             BSONElement e = cmdObj["w"];
             if ( e.ok() ) {
 
-                if ( cmdLine.configsvr ) {
+                if ( cmdLine.configsvr && (!e.isNumber() || e.numberInt() > 1) ) {
+                    // w:1 on config servers should still work, but anything greater than that
+                    // should not.
                     result.append( "wnote", "can't use w on config servers" );
                     result.append( "err", "norepl" );
                     return true;
@@ -280,7 +281,6 @@ namespace mongo {
         virtual bool slaveOk() const {
             return true;
         }
-        virtual bool requiresAuth() { return false; }
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {} // No auth required
@@ -965,8 +965,7 @@ namespace mongo {
             BSONObj query = BSON( "files_id" << jsobj["filemd5"] << "n" << GTE << n );
             BSONObj sort = BSON( "files_id" << 1 << "n" << 1 );
 
-            shared_ptr<Cursor> cursor = NamespaceDetailsTransient::bestGuessCursor(ns.c_str(),
-                                                                                   query, sort);
+            shared_ptr<Cursor> cursor = getBestGuessCursor(ns.c_str(), query, sort);
             if ( ! cursor ) {
                 errmsg = "need an index on { files_id : 1 , n : 1 }";
                 return false;
@@ -1463,6 +1462,14 @@ namespace mongo {
             if( d )
                 result.appendNumber( "nsSizeMB", (int) d->namespaceIndex.fileLength() / 1024 / 1024 );
 
+            BSONObjBuilder dataFileVersion( result.subobjStart( "dataFileVersion" ) );
+            if ( d && !d->isEmpty() ) {
+                DataFileHeader* header = d->getFile( 0 )->getHeader();
+                dataFileVersion.append( "major", header->version );
+                dataFileVersion.append( "minor", header->versionMinor );
+            }
+            dataFileVersion.done();
+
             return true;
         }
     } cmdDBStats;
@@ -1621,7 +1628,6 @@ namespace mongo {
         virtual void help( stringstream &help ) const {
             help << "{whatsmyuri:1}";
         }
-        virtual bool requiresAuth() { return false; }
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {} // No auth required
@@ -1641,7 +1647,6 @@ namespace mongo {
         virtual bool slaveOk() const { return true; }
         virtual LockType locktype() const { return NONE; }
         // No auth needed because it only works when enabled via command line.
-        virtual bool requiresAuth() { return false; }
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {}
@@ -1781,7 +1786,6 @@ namespace mongo {
             help << "w:true write lock. secs:<seconds>";
         }
         // No auth needed because it only works when enabled via command line.
-        virtual bool requiresAuth() { return false; }
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {}
@@ -1817,7 +1821,6 @@ namespace mongo {
         virtual bool slaveOk() const { return false; }
         virtual LockType locktype() const { return WRITE; }
         // No auth needed because it only works when enabled via command line.
-        virtual bool requiresAuth() { return false; }
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {}
@@ -1856,7 +1859,6 @@ namespace mongo {
         virtual LockType locktype() const { return WRITE; }
         virtual bool logTheOp() { return true; }
         // No auth needed because it only works when enabled via command line.
-        virtual bool requiresAuth() { return false; }
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {}
@@ -1923,7 +1925,9 @@ namespace mongo {
 
         std::string dbname = nsToDatabase( cmdns );
 
-        if (c->adminOnly() && c->localHostOnlyIfNoAuth(cmdObj) && noauth &&
+        if (c->adminOnly() &&
+                c->localHostOnlyIfNoAuth(cmdObj) &&
+                !AuthorizationManager::isAuthEnabled() &&
                 !client.getIsLocalHostConnection()) {
             log() << "command denied: " << cmdObj.toString() << endl;
             appendCommandStatus(result,
@@ -1939,7 +1943,7 @@ namespace mongo {
             return;
         }
 
-        if (!noauth && c->requiresAuth()) {
+        if (AuthorizationManager::isAuthEnabled()) {
             std::vector<Privilege> privileges;
             c->addRequiredPrivileges(dbname, cmdObj, &privileges);
             Status status = client.getAuthorizationManager()->checkAuthForPrivileges(privileges);
